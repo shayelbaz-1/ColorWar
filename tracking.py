@@ -161,6 +161,13 @@ class _PlayerDetectState:
 # ---------------------------------------------------------------------------
 _KERN_OPEN = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 _KERN_CLOSE = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+_KERN_OPEN_THIN = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+_KERN_CLOSE_THIN = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+_KERN_COLOR_INNER = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+
+_ROI_HALF_SIZE = max(90, int(TRACKING_REACQUIRE_MAX_JUMP * 0.65))
+_MIN_EXTENT_SMALL = 0.12
+_MIN_SHORT_SIDE_SMALL = 2.5
 
 
 # ---------------------------------------------------------------------------
@@ -254,10 +261,38 @@ class PaddleTracker:
         st = self._state[is_p1]
         lower = np.array([st.h_min, st.s_min, st.v_min])
         upper = np.array([st.h_max, st.s_max, st.v_max])
-        mask = cv2.inRange(hsv_blurred, lower, upper)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, _KERN_OPEN)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, _KERN_CLOSE)
-        return mask
+        raw = cv2.inRange(hsv_blurred, lower, upper)
+
+        # Main branch: robust cleanup for normal face-on blobs.
+        mask_main = cv2.morphologyEx(raw, cv2.MORPH_OPEN, _KERN_OPEN)
+        mask_main = cv2.morphologyEx(mask_main, cv2.MORPH_CLOSE, _KERN_CLOSE)
+
+        # Thin branch: preserve edge-on blobs that can be erased by the
+        # larger opening kernel above.
+        mask_thin = cv2.morphologyEx(raw, cv2.MORPH_OPEN, _KERN_OPEN_THIN)
+        mask_thin = cv2.morphologyEx(mask_thin, cv2.MORPH_CLOSE, _KERN_CLOSE_THIN)
+        mask_thin = cv2.dilate(mask_thin, _KERN_OPEN_THIN, iterations=1)
+
+        return cv2.bitwise_or(mask_main, mask_thin)
+
+    @staticmethod
+    def _contour_pixels(hsv: np.ndarray, contour: np.ndarray) -> np.ndarray:
+        """Sample mostly interior contour pixels to reduce boundary bleed."""
+        cmask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+        cv2.drawContours(cmask, [contour], -1, 255, -1)
+
+        inner = cv2.erode(cmask, _KERN_COLOR_INNER, iterations=1)
+        use_mask = inner if np.count_nonzero(inner) >= 12 else cmask
+        return hsv[use_mask > 0]
+
+    @staticmethod
+    def _purity_for_state(pixels: np.ndarray, st: _PlayerDetectState) -> float:
+        if len(pixels) == 0:
+            return 0.0
+        lower = np.array([st.h_min, st.s_min, st.v_min])
+        upper = np.array([st.h_max, st.s_max, st.v_max])
+        in_range = np.all((pixels >= lower) & (pixels <= upper), axis=1)
+        return float(np.mean(in_range))
 
     # ------------------------------------------------------------------
     # Per-contour feature scoring
@@ -265,19 +300,16 @@ class PaddleTracker:
     def _color_score(self, contour: np.ndarray, hsv: np.ndarray, is_p1: bool) -> float:
         """HSV in-range purity + saturation strength."""
         st = self._state[is_p1]
-        cmask = np.zeros(hsv.shape[:2], dtype=np.uint8)
-        cv2.drawContours(cmask, [contour], -1, 255, -1)
-        pixels = hsv[cmask > 0]
+        pixels = self._contour_pixels(hsv, contour)
         if len(pixels) < 5:
             return 0.0
 
-        lower = np.array([st.h_min, st.s_min, st.v_min])
-        upper = np.array([st.h_max, st.s_max, st.v_max])
-        in_range = np.all((pixels >= lower) & (pixels <= upper), axis=1)
-        purity = float(np.mean(in_range))
+        own_purity = self._purity_for_state(pixels, st)
+        opp_purity = self._purity_for_state(pixels, self._state[not is_p1])
+        purity = max(0.0, own_purity - 0.55 * opp_purity)
 
         avg_sat = float(np.mean(pixels[:, 1])) / 255.0
-        return purity * 0.7 + avg_sat * 0.3
+        return purity * 0.65 + avg_sat * 0.25 + own_purity * 0.10
 
     def _edge_score(self, contour: np.ndarray) -> float:
         """Canny edge density along contour boundary."""
@@ -356,52 +388,84 @@ class PaddleTracker:
         """
         st = self._state[is_p1]
         mask = self._get_mask(hsv_blurred, is_p1)
-        contours, _ = cv2.findContours(
-            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
-        )
 
         candidates = []
-        for c in contours:
-            area = cv2.contourArea(c)
-            if area < MIN_CONTOUR_AREA_EDGEON or area > CONTOUR_AREA_MAX:
-                continue
-            bx, by, bw, bh = cv2.boundingRect(c)
-            if bw == 0 or bh == 0:
-                continue
-            aspect = max(bw / bh, bh / bw)
-            if aspect > EDGE_ON_ASPECT_MAX:
-                continue
+        def _score_mask(mask_view: np.ndarray, x_off: int = 0, y_off: int = 0):
+            contours, _ = cv2.findContours(
+                mask_view, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
+            )
 
-            # --- Feature scores ---
-            c_score = self._color_score(c, hsv, is_p1)
-            e_score = self._edge_score(c)
-            s_score = self._shape_score(c)
-            p_score = self._proximity_score(c, st.prev_pos)
-            m_overlap = self._motion_overlap(c)
+            for c_local in contours:
+                if x_off or y_off:
+                    c = c_local.copy()
+                    c[:, 0, 0] += x_off
+                    c[:, 0, 1] += y_off
+                else:
+                    c = c_local
 
-            # Motion gate: if motion mask is enabled and overlap is too low,
-            # penalise softly (paddle may be briefly still during gameplay)
-            motion_mult = 1.0
-            if self._motion_mask is not None and m_overlap < MOTION_MASK_MIN_OVERLAP:
-                motion_mult = MOTION_PENALTY_MULT
+                area = cv2.contourArea(c)
+                if area < MIN_CONTOUR_AREA_EDGEON or area > CONTOUR_AREA_MAX:
+                    continue
 
-            fused = (
-                c_score * DETECT_COLOR_WEIGHT
-                + e_score * DETECT_EDGE_WEIGHT
-                + s_score * DETECT_SHAPE_WEIGHT
-                + p_score * DETECT_PROXIMITY_WEIGHT
-            ) * motion_mult
+                bx, by, bw, bh = cv2.boundingRect(c)
+                if bw == 0 or bh == 0:
+                    continue
 
-            # Edge-on boost: when contour is very thin (high aspect) but
-            # colour match is solid, compensate for the low shape score
-            # that thin views inevitably produce.
-            if aspect > 4.0 and c_score >= 0.35:
-                edgeon_boost = min(0.10, c_score * 0.15)
-                fused += edgeon_boost
+                aspect = max(bw / bh, bh / bw)
+                if aspect > EDGE_ON_ASPECT_MAX:
+                    continue
 
-            cx = bx + bw / 2.0
-            cy = by + bh / 2.0
-            candidates.append((c, cx, cy, fused, c_score, e_score, s_score, p_score, m_overlap))
+                extent = area / float(max(bw * bh, 1))
+                (_, _), (rw, rh), _ = cv2.minAreaRect(c)
+                short_side = min(rw, rh)
+                if area < MIN_CONTOUR_AREA and (extent < _MIN_EXTENT_SMALL or short_side < _MIN_SHORT_SIDE_SMALL):
+                    continue
+
+                # --- Feature scores ---
+                c_score = self._color_score(c, hsv, is_p1)
+                e_score = self._edge_score(c)
+                s_score = self._shape_score(c)
+                p_score = self._proximity_score(c, st.prev_pos)
+                m_overlap = self._motion_overlap(c)
+
+                # Motion gate: if motion mask is enabled and overlap is too low,
+                # penalise softly (paddle may be briefly still during gameplay)
+                motion_mult = 1.0
+                if self._motion_mask is not None and m_overlap < MOTION_MASK_MIN_OVERLAP:
+                    motion_mult = MOTION_PENALTY_MULT
+
+                fused = (
+                    c_score * DETECT_COLOR_WEIGHT
+                    + e_score * DETECT_EDGE_WEIGHT
+                    + s_score * DETECT_SHAPE_WEIGHT
+                    + p_score * DETECT_PROXIMITY_WEIGHT
+                ) * motion_mult
+
+                # Edge-on boost: when contour is very thin (high aspect) but
+                # colour match is solid, compensate for the low shape score
+                # that thin views inevitably produce.
+                if aspect > 4.0 and c_score >= 0.35:
+                    edgeon_boost = min(0.10, c_score * 0.15)
+                    fused += edgeon_boost
+
+                cx = bx + bw / 2.0
+                cy = by + bh / 2.0
+                candidates.append((c, cx, cy, fused, c_score, e_score, s_score, p_score, m_overlap))
+
+        # ROI-first search near previous position to reduce distractors.
+        px = int(round(st.prev_pos[0]))
+        py = int(round(st.prev_pos[1]))
+        x0 = max(0, px - _ROI_HALF_SIZE)
+        x1 = min(WIDTH, px + _ROI_HALF_SIZE)
+        y0 = max(0, py - _ROI_HALF_SIZE)
+        y1 = min(HEIGHT, py + _ROI_HALF_SIZE)
+
+        if (x1 - x0) > 8 and (y1 - y0) > 8:
+            _score_mask(mask[y0:y1, x0:x1], x0, y0)
+
+        # Fallback to full frame when ROI has no candidates.
+        if not candidates:
+            _score_mask(mask)
 
         if not candidates:
             st.color_score = 0.0
@@ -456,7 +520,7 @@ class PaddleTracker:
         contour, center, conf = self._detect(hsv_raw, hsv_blurred, is_p1)
 
         # Update position
-        if conf > 0.05:
+        if conf >= CONFIDENCE_HOLD:
             # EMA smoothing
             alpha = EMA_ALPHA
             st.smooth_pos = alpha * center + (1.0 - alpha) * st.smooth_pos
@@ -545,14 +609,17 @@ class PaddleTracker:
                         continue
 
                 # Colour purity
-                cmask = np.zeros(hsv.shape[:2], dtype=np.uint8)
-                cv2.drawContours(cmask, [c], -1, 255, -1)
-                pixels = hsv[cmask > 0]
+                pixels = self._contour_pixels(hsv, c)
                 if len(pixels) < 10:
                     continue
                 avg_sat = float(np.mean(pixels[:, 1]))
                 if avg_sat < sat_floor:
                     n_rejected_sat += 1
+                    continue
+                own_purity = self._purity_for_state(pixels, st)
+                opp_purity = self._purity_for_state(pixels, self._state[not is_p1])
+                color_sep = max(0.0, own_purity - 0.5 * opp_purity)
+                if color_sep < 0.10:
                     continue
 
                 # Edge evidence bonus (helps separate real paddle from
@@ -564,7 +631,7 @@ class PaddleTracker:
 
                 solidity, _ = _contour_quality(c)
                 quality_bonus = 1.5 if is_strong else 0.8
-                score = area * solidity * (avg_sat / 255.0) * quality_bonus * e_bonus
+                score = area * solidity * (avg_sat / 255.0) * quality_bonus * e_bonus * (0.3 + color_sep)
                 if score > best_score:
                     best_score = score
                     best_contour = c
@@ -606,9 +673,7 @@ class PaddleTracker:
     def _refine_hsv_from_contour(
         self, hsv: np.ndarray, contour: np.ndarray, is_p1: bool,
     ):
-        contour_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
-        cv2.drawContours(contour_mask, [contour], -1, 255, -1)
-        pixels = hsv[contour_mask > 0]
+        pixels = self._contour_pixels(hsv, contour)
         if len(pixels) < 20:
             return
         st = self._state[is_p1]
@@ -674,9 +739,7 @@ class PaddleTracker:
         if not _passes_quality_strict(contour):
             return
 
-        contour_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
-        cv2.drawContours(contour_mask, [contour], -1, 255, -1)
-        pixels = hsv[contour_mask > 0]
+        pixels = self._contour_pixels(hsv, contour)
         if len(pixels) < 30:
             return
         hues = pixels[:, 0].astype(float)
