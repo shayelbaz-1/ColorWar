@@ -1,0 +1,36 @@
+{
+  "total_frames": 987,
+  "duration_s": 45.1,
+  "p1": {
+    "color_valid_pct": 56.6,
+    "edge_valid_pct": 15.4,
+    "shape_valid_pct": 56.6,
+    "fused_above_trust_pct": 56.4,
+    "avg_color": 0.442,
+    "avg_edge": 0.04,
+    "avg_shape": 0.507,
+    "avg_fused": 0.348,
+    "top_reject_reasons": [
+      [
+        "no candidates",
+        428
+      ]
+    ]
+  },
+  "p2": {
+    "color_valid_pct": 12.9,
+    "edge_valid_pct": 1.6,
+    "shape_valid_pct": 12.9,
+    "fused_above_trust_pct": 12.3,
+    "avg_color": 0.095,
+    "avg_edge": 0.003,
+    "avg_shape": 0.101,
+    "avg_fused": 0.063,
+    "top_reject_reasons": [
+      [
+        "no candidates",
+        860
+      ]
+    ]
+  }
+}
