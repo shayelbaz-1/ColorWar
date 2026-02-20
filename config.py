@@ -194,6 +194,32 @@ MIN_CONTOUR_AREA_EDGEON = 30     # min px area for edge-on candidates (very thin
 EDGE_ON_ASPECT_MAX = 14.0        # max bounding-rect aspect ratio (very thin allowed)
 
 # ---------------------------------------------------------------------------
+# Kalman filter (kinematic motion prediction)
+# ---------------------------------------------------------------------------
+KALMAN_PROCESS_NOISE = 1e-2      # process noise covariance (higher = trust measurements more)
+KALMAN_MEASUREMENT_NOISE = 1e-1  # measurement noise covariance (higher = smoother)
+KALMAN_MISS_LIMIT = 15           # max consecutive misses before Kalman resets
+
+# ---------------------------------------------------------------------------
+# CSRT visual tracker (fallback when color detector fails)
+# ---------------------------------------------------------------------------
+USE_CSRT_FALLBACK = True         # enable CSRT tracker as fallback
+CSRT_CONFIDENCE_MIN = 0.30       # min CSRT confidence to trust its bounding box
+CSRT_REINIT_INTERVAL = 10        # re-init CSRT every N successful detections
+
+# ---------------------------------------------------------------------------
+# LAB color space scoring
+# ---------------------------------------------------------------------------
+DETECT_LAB_WEIGHT = 0.15         # weight for LAB-based color distance score
+LAB_DIST_THRESHOLD = 45.0        # max delta-E distance to be considered paddle-like
+
+# ---------------------------------------------------------------------------
+# Temporal contour smoothing
+# ---------------------------------------------------------------------------
+CONTOUR_SMOOTH_FRAMES = 3        # number of past contours to blend
+CONTOUR_RESAMPLE_POINTS = 64     # fixed number of points for resampling contours
+
+# ---------------------------------------------------------------------------
 # Level progression (in-game)
 # ---------------------------------------------------------------------------
 LEVEL_INTERVAL_SECONDS = 10

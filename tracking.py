@@ -58,7 +58,22 @@ from .config import (
     # Hysteresis gate
     CONFIDENCE_HOLD,
     CONFIDENCE_GRACE_FRAMES,
+    # Kalman filter
+    KALMAN_PROCESS_NOISE,
+    KALMAN_MEASUREMENT_NOISE,
+    KALMAN_MISS_LIMIT,
+    # CSRT tracker
+    USE_CSRT_FALLBACK,
+    CSRT_CONFIDENCE_MIN,
+    CSRT_REINIT_INTERVAL,
+    # LAB color
+    DETECT_LAB_WEIGHT,
+    LAB_DIST_THRESHOLD,
+    # Contour smoothing
+    CONTOUR_SMOOTH_FRAMES,
+    CONTOUR_RESAMPLE_POINTS,
 )
+from collections import deque
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +155,68 @@ class _PlayerDetectState:
         self.debug_reject_reason: str = ""
         self.debug_lock_fail_reason: str = ""
 
+        # --- Kalman filter (6-state: x, y, dx, dy, w, h) ---
+        self.kalman: cv2.KalmanFilter = self._init_kalman(initial_pos)
+        self.kalman_miss_count: int = 0
+        self.kalman_pos: np.ndarray = initial_pos.copy()  # predicted position
+
+        # --- CSRT visual tracker ---
+        self.csrt: cv2.Tracker | None = None
+        self.csrt_bbox: tuple | None = None
+        self.csrt_good_count: int = 0  # counts successful detections for re-init
+
+        # --- LAB reference color (set during calibration click) ---
+        self.lab_ref: np.ndarray | None = None  # mean LAB of paddle pixels
+
+        # --- Temporal contour smoothing ---
+        self.contour_history: deque = deque(maxlen=CONTOUR_SMOOTH_FRAMES)
+
+    @staticmethod
+    def _init_kalman(initial_pos: np.ndarray) -> cv2.KalmanFilter:
+        kf = cv2.KalmanFilter(6, 4, 0)  # 6 state vars, 4 measurements
+        # Transition matrix: constant-velocity model
+        kf.transitionMatrix = np.array([
+            [1, 0, 1, 0, 0, 0],
+            [0, 1, 0, 1, 0, 0],
+            [0, 0, 1, 0, 0, 0],
+            [0, 0, 0, 1, 0, 0],
+            [0, 0, 0, 0, 1, 0],
+            [0, 0, 0, 0, 0, 1],
+        ], dtype=np.float32)
+        # Measurement matrix: we observe x, y, w, h
+        kf.measurementMatrix = np.array([
+            [1, 0, 0, 0, 0, 0],
+            [0, 1, 0, 0, 0, 0],
+            [0, 0, 0, 0, 1, 0],
+            [0, 0, 0, 0, 0, 1],
+        ], dtype=np.float32)
+        kf.processNoiseCov = np.eye(6, dtype=np.float32) * KALMAN_PROCESS_NOISE
+        kf.measurementNoiseCov = np.eye(4, dtype=np.float32) * KALMAN_MEASUREMENT_NOISE
+        kf.errorCovPost = np.eye(6, dtype=np.float32)
+        kf.statePost = np.array([
+            initial_pos[0], initial_pos[1], 0, 0, 40, 40,
+        ], dtype=np.float32)
+        return kf
+
+    def kalman_predict(self) -> np.ndarray:
+        """Run Kalman predict step AND return predicted [x, y]."""
+        pred = self.kalman.predict()
+        self.kalman_pos = np.array([float(pred[0, 0]), float(pred[1, 0])], dtype=float)
+        return self.kalman_pos
+
+    def kalman_correct(self, cx: float, cy: float, w: float, h: float):
+        """Feed measurement to Kalman."""
+        measurement = np.array([cx, cy, w, h], dtype=np.float32)
+        self.kalman.correct(measurement)
+        self.kalman_miss_count = 0
+
+    def kalman_mark_miss(self):
+        self.kalman_miss_count += 1
+        if self.kalman_miss_count >= KALMAN_MISS_LIMIT:
+            # Reset Kalman to last known good position
+            self.kalman = self._init_kalman(self.smooth_pos)
+            self.kalman_miss_count = 0
+
     @property
     def hsv_floor(self) -> dict:
         return HSV_FLOOR_CYAN if self.is_p1 else HSV_FLOOR_PINK
@@ -196,6 +273,10 @@ class PaddleTracker:
         self._curr_bgr: np.ndarray | None = None
         self._curr_gray: np.ndarray | None = None
         self._edge_map: np.ndarray | None = None
+        self._curr_lab: np.ndarray | None = None  # LAB color space image
+
+        # Game mode flag
+        self.in_game: bool = False
 
         # Optional background subtractor for motion mask
         self._bg_sub: cv2.BackgroundSubtractor | None = None
@@ -217,6 +298,9 @@ class PaddleTracker:
         blurred_gray = cv2.GaussianBlur(self._curr_gray, (5, 5), 0)
         self._edge_map = cv2.Canny(blurred_gray, EDGE_CANNY_LOW, EDGE_CANNY_HIGH)
 
+        # LAB color space (used for lighting-robust color scoring)
+        self._curr_lab = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2LAB)
+
         # Motion foreground mask
         if self._bg_sub is not None:
             fg = self._bg_sub.apply(frame_bgr, learningRate=MOTION_MASK_LEARNING_RATE)
@@ -226,6 +310,10 @@ class PaddleTracker:
             self._motion_mask = fg
         else:
             self._motion_mask = None
+
+        # Kalman predict step for both players (sets kalman_pos before detection)
+        for is_p1 in (True, False):
+            self._state[is_p1].kalman_predict()
 
     def end_frame(self):
         """Called after all detection calls.  Stores previous positions."""
@@ -306,7 +394,7 @@ class PaddleTracker:
     # Per-contour feature scoring
     # ------------------------------------------------------------------
     def _color_score(self, contour: np.ndarray, hsv: np.ndarray, is_p1: bool) -> float:
-        """HSV in-range purity + saturation strength."""
+        """HSV in-range purity + saturation strength + LAB distance."""
         st = self._state[is_p1]
         pixels = self._contour_pixels(hsv, contour)
         if len(pixels) < 5:
@@ -317,7 +405,35 @@ class PaddleTracker:
         purity = max(0.0, own_purity - 0.55 * opp_purity)
 
         avg_sat = float(np.mean(pixels[:, 1])) / 255.0
-        return purity * 0.65 + avg_sat * 0.25 + own_purity * 0.10
+        hsv_score = purity * 0.65 + avg_sat * 0.25 + own_purity * 0.10
+
+        # LAB distance scoring (lighting-robust)
+        lab_score = self._lab_score(contour, is_p1)
+
+        # Fuse HSV and LAB
+        if lab_score >= 0:
+            total_w = DETECT_COLOR_WEIGHT + DETECT_LAB_WEIGHT
+            return (hsv_score * DETECT_COLOR_WEIGHT + lab_score * DETECT_LAB_WEIGHT) / total_w
+        return hsv_score
+
+    def _lab_score(self, contour: np.ndarray, is_p1: bool) -> float:
+        """Score contour based on LAB color distance to reference."""
+        st = self._state[is_p1]
+        if st.lab_ref is None or self._curr_lab is None:
+            return -1.0  # no reference yet
+
+        # Sample LAB pixels inside contour
+        cmask = np.zeros(self._curr_lab.shape[:2], dtype=np.uint8)
+        cv2.drawContours(cmask, [contour], -1, 255, -1)
+        lab_pixels = self._curr_lab[cmask > 0]
+        if len(lab_pixels) < 5:
+            return -1.0
+
+        mean_lab = np.mean(lab_pixels, axis=0).astype(float)
+        # Delta-E (simple Euclidean in LAB for speed)
+        delta_e = np.sqrt(np.sum((mean_lab - st.lab_ref.astype(float)) ** 2))
+        # Normalize: 0 at threshold, 1 at 0 distance
+        return max(0.0, 1.0 - delta_e / LAB_DIST_THRESHOLD)
 
     def _edge_score(self, contour: np.ndarray) -> float:
         """Canny edge density along contour boundary."""
@@ -460,9 +576,10 @@ class PaddleTracker:
                 cy = by + bh / 2.0
                 candidates.append((c, cx, cy, fused, c_score, e_score, s_score, p_score, m_overlap))
 
-        # ROI-first search near previous position to reduce distractors.
-        px = int(round(st.prev_pos[0]))
-        py = int(round(st.prev_pos[1]))
+        # ROI-first search near Kalman-predicted position (or prev_pos).
+        kp = st.kalman_pos
+        px = int(round(kp[0]))
+        py = int(round(kp[1]))
         x0 = max(0, px - _ROI_HALF_SIZE)
         x1 = min(WIDTH, px + _ROI_HALF_SIZE)
         y0 = max(0, py - _ROI_HALF_SIZE)
@@ -470,6 +587,17 @@ class PaddleTracker:
 
         if (x1 - x0) > 8 and (y1 - y0) > 8:
             _score_mask(mask[y0:y1, x0:x1], x0, y0)
+
+        # Fallback: CSRT bounding box ROI if available and no candidates.
+        if not candidates and st.csrt_bbox is not None and USE_CSRT_FALLBACK:
+            bx, by, bw, bh = st.csrt_bbox
+            pad = int(max(bw, bh) * 0.3)
+            cx0 = max(0, bx - pad)
+            cy0 = max(0, by - pad)
+            cx1 = min(WIDTH, bx + bw + pad)
+            cy1 = min(HEIGHT, by + bh + pad)
+            if (cx1 - cx0) > 8 and (cy1 - cy0) > 8:
+                _score_mask(mask[cy0:cy1, cx0:cx1], cx0, cy0)
 
         # Fallback to full frame when ROI has no candidates.
         if not candidates:
@@ -568,67 +696,154 @@ class PaddleTracker:
         st = self._state[is_p1]
 
         # Build raw HSV from blurred (needed for color scoring)
-        # The caller passes hsv_blurred; we also need the unblurred HSV
-        # for pixel sampling.  Re-derive from stored BGR.
         if self._curr_bgr is not None:
             hsv_raw = cv2.cvtColor(self._curr_bgr, cv2.COLOR_BGR2HSV)
         else:
             hsv_raw = hsv_blurred
 
+        # --- CSRT update (runs every frame for visual continuity) ---
+        if USE_CSRT_FALLBACK and st.csrt is not None and self._curr_bgr is not None:
+            ok, bbox = st.csrt.update(self._curr_bgr)
+            if ok:
+                st.csrt_bbox = tuple(int(v) for v in bbox)
+            else:
+                st.csrt_bbox = None
+        else:
+            st.csrt_bbox = None
+
+        # --- Per-frame multi-cue detection ---
         contour, center, conf = self._detect(hsv_raw, hsv_blurred, is_p1)
-        
+
         if contour is not None and self._curr_bgr is not None:
             contour = self._refine_contour_watershed(self._curr_bgr, contour)
 
-        # Update position
-        if conf >= CONFIDENCE_HOLD:
+        # --- Kalman correction / miss tracking ---
+        if conf >= CONFIDENCE_HOLD and contour is not None:
+            bx, by, bw, bh = cv2.boundingRect(contour)
+            st.kalman_correct(center[0], center[1], float(bw), float(bh))
+
             # EMA smoothing
             alpha = EMA_ALPHA
             st.smooth_pos = alpha * center + (1.0 - alpha) * st.smooth_pos
             st.prev_pos = center.copy()
             st.miss_count = 0
             st.last_seen_time = _time.time()
+
+            # --- CSRT re-initialization on good detections ---
+            if USE_CSRT_FALLBACK and self._curr_bgr is not None:
+                st.csrt_good_count += 1
+                if st.csrt_good_count >= CSRT_REINIT_INTERVAL or st.csrt is None:
+                    st.csrt_good_count = 0
+                    pad = 15
+                    rx = max(0, bx - pad)
+                    ry = max(0, by - pad)
+                    rw = min(bw + 2 * pad, WIDTH - rx)
+                    rh = min(bh + 2 * pad, HEIGHT - ry)
+                    if rw > 5 and rh > 5:
+                        try:
+                            st.csrt = cv2.TrackerCSRT_create()
+                            st.csrt.init(self._curr_bgr, (rx, ry, rw, rh))
+                        except Exception:
+                            st.csrt = None
+
+            # --- Update LAB reference from good detections ---
+            if self._curr_lab is not None and st.lab_ref is None:
+                cmask = np.zeros(self._curr_lab.shape[:2], dtype=np.uint8)
+                cv2.drawContours(cmask, [contour], -1, 255, -1)
+                lab_px = self._curr_lab[cmask > 0]
+                if len(lab_px) >= 10:
+                    st.lab_ref = np.mean(lab_px, axis=0)
         else:
             st.miss_count += 1
+            st.kalman_mark_miss()
+            # Use Kalman prediction for smooth_pos during misses
+            st.smooth_pos = st.kalman_pos.copy()
 
         # Clamp to frame
         sx = float(max(0.0, min(st.smooth_pos[0], float(WIDTH))))
         sy = float(max(0.0, min(st.smooth_pos[1], float(HEIGHT))))
         out_pos = np.array([sx, sy], dtype=float)
 
+        # --- Temporal contour smoothing ---
+        if contour is not None:
+            st.contour_history.append(contour)
+        smoothed_contour = self._smooth_contour(st) if contour is not None else None
+
+        # Use smoothed contour for output
+        use_contour = smoothed_contour if smoothed_contour is not None else contour
+
         # PARITY: Hysteresis confidence gate with grace frames.
-        # - Enter contour mode at TRACKING_CONFIDENCE_MIN (higher bar).
-        # - Keep contour mode down to CONFIDENCE_HOLD (lower bar).
-        # - When confidence drops below HOLD, wait GRACE frames before
-        #   switching to circle to prevent single-frame flicker.
-        # calibration_app.py uses the same track_paddle output, so parity
-        # is maintained automatically.
         if st._contour_held:
-            # Currently showing contour — use lower threshold to keep it
-            if conf >= CONFIDENCE_HOLD and contour is not None:
+            if conf >= CONFIDENCE_HOLD and use_contour is not None:
                 st._grace_counter = CONFIDENCE_GRACE_FRAMES
-                st._last_contour = contour
-                out_contour = contour
+                st._last_contour = use_contour
+                out_contour = use_contour
             elif st._grace_counter > 0:
-                # Grace period — keep showing last good contour
                 st._grace_counter -= 1
                 out_contour = st._last_contour
             else:
-                # Grace expired — drop to circle
                 st._contour_held = False
                 st._last_contour = None
                 out_contour = None
         else:
-            # Currently showing circle — need higher confidence to enter
-            if conf >= TRACKING_CONFIDENCE_MIN and contour is not None:
+            if conf >= TRACKING_CONFIDENCE_MIN and use_contour is not None:
                 st._contour_held = True
                 st._grace_counter = CONFIDENCE_GRACE_FRAMES
-                st._last_contour = contour
-                out_contour = contour
+                st._last_contour = use_contour
+                out_contour = use_contour
             else:
                 out_contour = None
 
         return out_pos, out_contour
+
+    @staticmethod
+    def _resample_contour(contour: np.ndarray, n_points: int) -> np.ndarray:
+        """Resample contour to a fixed number of evenly-spaced points."""
+        contour_2d = contour.reshape(-1, 2).astype(float)
+        if len(contour_2d) < 3:
+            return contour
+        # Arc-length parameterization
+        diffs = np.diff(contour_2d, axis=0)
+        dists = np.sqrt((diffs ** 2).sum(axis=1))
+        cum = np.concatenate([[0], np.cumsum(dists)])
+        total = cum[-1]
+        if total < 1e-6:
+            return contour
+        # Interpolate
+        targets = np.linspace(0, total, n_points, endpoint=False)
+        xs = np.interp(targets, cum, contour_2d[:, 0])
+        ys = np.interp(targets, cum, contour_2d[:, 1])
+        resampled = np.stack([xs, ys], axis=1).astype(np.int32)
+        return resampled.reshape(-1, 1, 2)
+
+    @staticmethod
+    def _smooth_contour(st: '_PlayerDetectState') -> np.ndarray | None:
+        """Blend last N contour shapes for temporal smoothing."""
+        history = st.contour_history
+        if len(history) == 0:
+            return None
+        if len(history) == 1:
+            return history[0]
+
+        n = CONTOUR_RESAMPLE_POINTS
+        resampled = []
+        for c in history:
+            r = PaddleTracker._resample_contour(c, n)
+            if r.shape[0] == n:
+                resampled.append(r.reshape(n, 2).astype(float))
+
+        if not resampled:
+            return history[-1]
+
+        # Weighted average (newest = highest weight)
+        weights = np.array([0.5 ** i for i in range(len(resampled) - 1, -1, -1)])
+        weights /= weights.sum()
+
+        blended = np.zeros((n, 2), dtype=float)
+        for w, pts in zip(weights, resampled):
+            blended += w * pts
+
+        return blended.astype(np.int32).reshape(-1, 1, 2)
 
     # ------------------------------------------------------------------
     # Calibration (runs during STATE_AUTODETECT)
