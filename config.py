@@ -38,13 +38,13 @@ PAUSE_HOLD_DURATION = 2.0   # seconds holding paddles at top to pause
 PAUSE_TOP_THRESHOLD = 60    # y-pixels from top edge
 
 # ---------------------------------------------------------------------------
-# Fixed player colors (BGR) — cyan for P1, pink for P2
+# Fixed player colors (BGR) — pastel cyan for P1, pastel pink for P2
 # ---------------------------------------------------------------------------
-COLOR_P1 = (255, 255, 0)        # Cyan  (BGR)
-COLOR_P2 = (180, 0, 255)        # Pink  (BGR)
+COLOR_P1 = (186, 224, 164)      # Pastel Cyan (Hex #a4e0ba)
+COLOR_P2 = (209, 139, 229)      # Pastel Pink (Hex #e58bd1)
 COLOR_POWERUP = (0, 255, 0)     # Green
 COLOR_BOMB = (0, 0, 200)        # Dark red
-COLOR_WHITE = (255, 255, 255)
+COLOR_WHITE = (216, 240, 255)   # Pastel BG tint (Hex #fff0d8)
 COLOR_BLACK = (0, 0, 0)
 COLOR_GRAY = (100, 100, 100)
 COLOR_MIDLINE = (200, 200, 200)
@@ -215,8 +215,9 @@ ENDING_JINGLE_INTERVAL = 1.0
 # Screen shake
 # ---------------------------------------------------------------------------
 SHAKE_DURATION = 0.15
-SHAKE_INTENSITY_HIT = 4
-SHAKE_INTENSITY_LEVEL = 8
+SHAKE_INTENSITY_HIT = 6
+SHAKE_INTENSITY_LEVEL = 10
+HIT_PAUSE_FRAMES = 3
 
 # ---------------------------------------------------------------------------
 # Combo system

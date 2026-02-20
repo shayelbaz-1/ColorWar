@@ -4,6 +4,7 @@ import numpy as np
 import time
 import pygame
 import math
+import os
 
 from .config import (
     WIDTH,
@@ -23,16 +24,23 @@ from .config import (
 )
 
 pygame.font.init()
-try:
-    FONT_TITLE = pygame.font.SysFont("impact", 60)
-    FONT_LARGE = pygame.font.SysFont("impact", 40)
-    FONT_MEDIUM = pygame.font.SysFont("arial", 24, bold=True)
-    FONT_SMALL = pygame.font.SysFont("arial", 18)
-except:
-    FONT_TITLE = pygame.font.Font(None, 60)
-    FONT_LARGE = pygame.font.Font(None, 40)
-    FONT_MEDIUM = pygame.font.Font(None, 24)
-    FONT_SMALL = pygame.font.Font(None, 18)
+font_path = "assets/PressStart2P.ttf"
+if os.path.exists(font_path):
+    FONT_TITLE = pygame.font.Font(font_path, 40)
+    FONT_LARGE = pygame.font.Font(font_path, 24)
+    FONT_MEDIUM = pygame.font.Font(font_path, 16)
+    FONT_SMALL = pygame.font.Font(font_path, 10)
+else:
+    try:
+        FONT_TITLE = pygame.font.SysFont("courier", 50, bold=True)
+        FONT_LARGE = pygame.font.SysFont("courier", 36, bold=True)
+        FONT_MEDIUM = pygame.font.SysFont("courier", 24, bold=True)
+        FONT_SMALL = pygame.font.SysFont("courier", 16)
+    except:
+        FONT_TITLE = pygame.font.Font(None, 60)
+        FONT_LARGE = pygame.font.Font(None, 40)
+        FONT_MEDIUM = pygame.font.Font(None, 24)
+        FONT_SMALL = pygame.font.Font(None, 18)
 
 def to_rgb(bgr_color):
     """Convert OpenCV BGR to Pygame RGB."""
@@ -93,31 +101,47 @@ class HoverButton:
         return 0.0
 
     def draw(self, surface: pygame.Surface, progress: float = 0.0):
-        rgb_col = to_rgb(self.color)
+        rgb_col = to_rgb(self.color)[:3]
         
-        # Background
+        # Pulse alpha and add glow when hovered
+        alpha = 100
+        if progress > 0.0:
+            # Pulsating opacity
+            alpha = int(140 + 40 * math.sin(time.time() * 10))
+            
+            # Draw glowing halo
+            halo_surf = pygame.Surface((self.rect.width + 20, self.rect.height + 20), pygame.SRCALPHA)
+            pygame.draw.rect(halo_surf, (*rgb_col, 50), halo_surf.get_rect(), border_radius=12)
+            surface.blit(halo_surf, (self.rect.x - 10, self.rect.y - 10))
+        
+        # Background rounded rect
         bg_surf = pygame.Surface((self.rect.width, self.rect.height), pygame.SRCALPHA)
-        bg_surf.fill((*rgb_col, 100))
+        pygame.draw.rect(bg_surf, (*rgb_col, alpha), bg_surf.get_rect(), border_radius=8)
         surface.blit(bg_surf, self.rect)
         
-        # Border
-        pygame.draw.rect(surface, rgb_col, self.rect, 2)
+        # 3D Highlight / Bevel
+        r, g, b = rgb_col
+        light = (min(r+100, 255), min(g+100, 255), min(b+100, 255))
+        dark = (max(r-80, 0), max(g-80, 0), max(b-80, 0))
         
-        # Text
-        text_surf = FONT_MEDIUM.render(self.label, True, to_rgb(COLOR_WHITE))
+        # Dark bottom/right edge
+        pygame.draw.rect(surface, dark, self.rect, 2, border_radius=8)
+        
+        # Light top/left edge overlay
+        light_rect = pygame.Rect(self.rect.x, self.rect.y, self.rect.width - 2, self.rect.height - 2)
+        pygame.draw.rect(surface, light, light_rect, 1, border_radius=8)
+        
+        # Text centering
+        text_surf = FONT_MEDIUM.render(self.label, True, (255, 255, 255))
         tx = self.rect.x + (self.rect.width - text_surf.get_width()) // 2
         ty = self.rect.y + (self.rect.height - text_surf.get_height()) // 2
         surface.blit(text_surf, (tx, ty))
         
+        # Sleek progress bar at bottom
         if progress > 0:
-            cx = self.rect.centerx
-            cy = self.rect.centery
-            rx = self.rect.width // 2 + 10
-            ry = self.rect.height // 2 + 10
-            arc_rect = pygame.Rect(cx - rx, cy - ry, 2*rx, 2*ry)
-            start_ang = math.pi / 2
-            end_ang = start_ang - (progress * 2 * math.pi)
-            pygame.draw.arc(surface, to_rgb(COLOR_WHITE), arc_rect, min(start_ang, end_ang + 2*math.pi), max(start_ang, end_ang + 2*math.pi), 3)
+            bar_w = int((self.rect.width - 16) * progress)
+            bar_rect = pygame.Rect(self.rect.x + 8, self.rect.bottom - 10, bar_w, 4)
+            pygame.draw.rect(surface, light, bar_rect, border_radius=2)
 
 # ---------------------------------------------------------------------------
 # UI manager
@@ -156,17 +180,34 @@ class UIManager:
             "home":    HoverButton(px, 300, 180, 50, "HOME",    (255, 100, 0)),
         }
 
-        # Results screen
         self.result_buttons: dict[str, HoverButton] = {
             "replay":     HoverButton(cx, 300, btn_w, btn_h, "WATCH REPLAY", (0, 100, 200)),
             "play_again": HoverButton(cx, 370, btn_w, btn_h, "PLAY AGAIN",   (0, 200, 0)),
-            "home":       HoverButton(cx, 440, btn_w, btn_h, "HOME",         (255, 100, 0)),
+            "home":       HoverButton(cx, 440, btn_w, btn_h, "HOME MENU",    (255, 100, 0)),
         }
 
         self.p1_color: tuple = COLOR_P1
         self.p2_color: tuple = COLOR_P2
 
-        self.pause_hold_start: float | None = None
+    def _draw_crt_overlay(self, surface: pygame.Surface):
+        # Scanlines removed
+        pass
+
+    @staticmethod
+    def _draw_glowing_cursor(surface: pygame.Surface, pos: tuple, color: tuple, radius: int = 12):
+        pos_int = (int(pos[0]), int(pos[1]))
+        rgb_col = to_rgb(color)[:3]
+        
+        # Pulsating outer glow
+        pulse = 1.2 + 0.3 * math.sin(time.time() * 8)
+        glow_rad = int(radius * pulse)
+        glow_surf = pygame.Surface((glow_rad*2, glow_rad*2), pygame.SRCALPHA)
+        pygame.draw.circle(glow_surf, (*rgb_col, 80), (glow_rad, glow_rad), glow_rad)
+        surface.blit(glow_surf, (pos_int[0] - glow_rad, pos_int[1] - glow_rad))
+        
+        # Inner core white, outer ring color
+        pygame.draw.circle(surface, (255, 255, 255), pos_int, radius - 4)
+        pygame.draw.circle(surface, rgb_col, pos_int, radius, 3)
 
     @staticmethod
     def _outlined_text(surface: pygame.Surface, text: str, pos: tuple, font: pygame.font.Font, color: tuple,
@@ -184,6 +225,24 @@ class UIManager:
         surface.blit(text_surf, pos)
 
     @staticmethod
+    def _outline_glow_text(surface: pygame.Surface, text: str, y: int, font: pygame.font.Font, glow_color: tuple, glow_size: int = 4):
+        glow_rgb = to_rgb(glow_color)[:3]
+        text_surf = font.render(text, True, glow_rgb)
+        x = (WIDTH - text_surf.get_width()) // 2
+        
+        # Draw multiple times with lower alpha for glow effect
+        # Pygame surface alpha works best with an intermediate surface
+        glow_surf = pygame.Surface((text_surf.get_width() + glow_size*4, text_surf.get_height() + glow_size*4), pygame.SRCALPHA)
+        for offset in range(glow_size, 0, -1):
+            alpha = int(100 / glow_size)
+            temp = font.render(text, True, (*glow_rgb, alpha))
+            
+            for dx, dy in [(-offset,-offset),(-offset,offset),(offset,-offset),(offset,offset),(0,-offset),(0,offset),(-offset,0),(offset,0)]:
+                glow_surf.blit(temp, (glow_size*2 + dx, glow_size*2 + dy))
+        
+        surface.blit(glow_surf, (x - glow_size*2, y - glow_size*2))
+
+    @staticmethod
     def _draw_centered_text(surface: pygame.Surface, text: str, y: int, font: pygame.font.Font, color: tuple,
                             outline_color=COLOR_BLACK, outline_thickness: int = 2):
         text_surf = font.render(text, True, to_rgb(color)[:3])
@@ -199,15 +258,26 @@ class UIManager:
         
         if step == 0:
             self._draw_centered_text(surface, "Click anywhere on the CYAN paddle", 200, FONT_LARGE, self.p1_color)
-            pygame.draw.circle(surface, to_rgb(self.p1_color)[:3], pygame.mouse.get_pos(), 10)
+            UIManager._draw_glowing_cursor(surface, pygame.mouse.get_pos(), self.p1_color, 10)
         elif step == 1:
             self._draw_centered_text(surface, "Click anywhere on the PINK paddle", 200, FONT_LARGE, self.p2_color)
-            pygame.draw.circle(surface, to_rgb(self.p2_color)[:3], pygame.mouse.get_pos(), 10)
+            UIManager._draw_glowing_cursor(surface, pygame.mouse.get_pos(), self.p2_color, 10)
 
     def draw_home(self, surface: pygame.Surface, p1_pos, p2_pos) -> str | None:
-        self._draw_centered_text(surface, "COLOR WAR PONG", 80, FONT_TITLE, COLOR_WHITE)
-        self._draw_centered_text(surface, "Hover paddle to select", 150, FONT_SMALL, COLOR_GRAY)
-        self._draw_centered_text(surface, f"Difficulty: {DIFFICULTY_NAMES[self.selected_difficulty]}", 260, FONT_MEDIUM, COLOR_WHITE)
+        over = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        over.fill((0, 0, 0, 150))
+        surface.blit(over, (0, 0))
+        
+        # Retro Glow Title
+        t = time.time()
+        base_color = (0, 150, 255) # Vibrant retro electric blue
+        c1 = (int(127 + 127*math.sin(t*3)), 255, 255)
+        c2 = (255, int(127 + 127*math.cos(t*2)), 255)
+        self._outline_glow_text(surface, "COLOR WAR", 60, FONT_TITLE, c1, glow_size=4)
+        self._draw_centered_text(surface, "COLOR WAR", 60, FONT_TITLE, base_color, c2, 1)
+        
+        self._draw_centered_text(surface, "Hover paddle over button to select", 130, FONT_SMALL, COLOR_GRAY)
+        self._draw_centered_text(surface, f"Difficulty:{DIFFICULTY_NAMES[self.selected_difficulty]}", 260, FONT_MEDIUM, COLOR_WHITE)
 
         positions = [p1_pos, p2_pos]
         action = None
@@ -232,11 +302,11 @@ class UIManager:
                     btn.hover_start = None
                     self.selected_difficulty = int(key.split("_")[1])
                     self._difficulty_visible = False
+        UIManager._draw_glowing_cursor(surface, p1_pos, self.p1_color)
+        UIManager._draw_glowing_cursor(surface, p2_pos, self.p2_color)
 
-        pygame.draw.circle(surface, to_rgb(self.p1_color)[:3], (int(p1_pos[0]), int(p1_pos[1])), 12)
-        pygame.draw.circle(surface, to_rgb(self.p2_color)[:3], (int(p2_pos[0]), int(p2_pos[1])), 12)
-
-        self._draw_centered_text(surface, "Hold both paddles at TOP to PAUSE during game", HEIGHT - 40, FONT_SMALL, COLOR_GRAY)
+        self._draw_centered_text(surface, "Hold both paddles at TOP to PAUSE during game", HEIGHT - 30, FONT_SMALL, COLOR_GRAY)
+        self._draw_crt_overlay(surface)
         return action
 
     def draw_pause(self, surface: pygame.Surface, p1_pos, p2_pos) -> str | None:
@@ -254,9 +324,10 @@ class UIManager:
             if prog >= 1.0:
                 btn.hover_start = None
                 action = key
-
-        pygame.draw.circle(surface, to_rgb(self.p1_color)[:3], (int(p1_pos[0]), int(p1_pos[1])), 12)
-        pygame.draw.circle(surface, to_rgb(self.p2_color)[:3], (int(p2_pos[0]), int(p2_pos[1])), 12)
+        UIManager._draw_glowing_cursor(surface, p1_pos, self.p1_color)
+        UIManager._draw_glowing_cursor(surface, p2_pos, self.p2_color)
+        
+        self._draw_crt_overlay(surface)
         return action
 
     def draw_results(self, surface: pygame.Surface, winner_text: str, p1_pct: int, p2_pct: int, p1_pos, p2_pos) -> str | None:
@@ -282,9 +353,10 @@ class UIManager:
             if prog >= 1.0:
                 btn.hover_start = None
                 action = key
-
-        pygame.draw.circle(surface, to_rgb(self.p1_color)[:3], (int(p1_pos[0]), int(p1_pos[1])), 12)
-        pygame.draw.circle(surface, to_rgb(self.p2_color)[:3], (int(p2_pos[0]), int(p2_pos[1])), 12)
+        UIManager._draw_glowing_cursor(surface, p1_pos, self.p1_color)
+        UIManager._draw_glowing_cursor(surface, p2_pos, self.p2_color)
+        
+        self._draw_crt_overlay(surface)
         return action
 
     def draw_hud(self, surface: pygame.Surface, time_left: int, difficulty: int, level: int = 1, level_up_until: float = 0,

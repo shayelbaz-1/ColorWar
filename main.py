@@ -69,6 +69,7 @@ class ColorWarApp:
 
         self.state: str = STATE_AUTODETECT
         self._calib_step: int = 0
+        self._current_bgm: str | None = None
 
         # Player positions and contours
         self.p1_pos = np.array([100, HEIGHT // 2], dtype=float)
@@ -142,6 +143,24 @@ class ColorWarApp:
                 pass
 
         threading.Thread(target=_play, daemon=True).start()
+
+    def _set_bgm(self, path: str | None):
+        if not self._sound_ready or self._current_bgm == path:
+            return
+        self._current_bgm = path
+        import pygame
+        if path is None:
+            pygame.mixer.music.fadeout(500)
+            return
+
+        import os
+        if os.path.exists(path):
+            try:
+                pygame.mixer.music.load(path)
+                pygame.mixer.music.set_volume(0.3)
+                pygame.mixer.music.play(-1)
+            except Exception as e:
+                print(f"BGM Error ({path}):", e)
 
     def _play_warning_sound(self):
         if not self._sound_ready:
@@ -360,11 +379,6 @@ class ColorWarApp:
         
         try:
             pygame.mixer.init()
-            import os
-            if os.path.exists("assets/bgm.mp3"):
-                pygame.mixer.music.load("assets/bgm.mp3")
-                pygame.mixer.music.set_volume(0.3)
-                pygame.mixer.music.play(-1)
         except Exception:
             pass
 
@@ -521,6 +535,8 @@ class ColorWarApp:
         return surf
 
     def _handle_home(self, frame: np.ndarray, bgr_to_surface) -> pygame.Surface:
+        self._set_bgm("assets/menu_bgm.wav")
+        self.tracker.in_game = False
         surf = bgr_to_surface(frame)
         action = self.ui.draw_home(surf, self.p1_pos, self.p2_pos)
         if action == "start":
@@ -528,6 +544,14 @@ class ColorWarApp:
         return surf
 
     def _handle_game(self, frame: np.ndarray, bgr_to_surface) -> pygame.Surface:
+        # Decide music pacing
+        if self.engine.time_left > 0 and self.engine.time_left <= 20:
+            self._set_bgm("assets/game_bgm_fast.wav")
+        else:
+            self._set_bgm("assets/game_bgm.wav")
+            
+        self.tracker.in_game = True
+        
         in_prestart = self.engine.in_prestart
 
         # Record raw camera frame for timelapse (skip prestart)
@@ -587,6 +611,7 @@ class ColorWarApp:
                   else None)
 
         obstacles = self.challenges.obstacles if self.challenges.obstacles_enabled else None
+        
         self.challenges.update(self.engine)
         still_running = self.engine.update(
             game_p1, game_p2, self.p1_prev, self.p2_prev, obstacles,
@@ -631,6 +656,8 @@ class ColorWarApp:
         return surf
 
     def _handle_pause(self, frame: np.ndarray, bgr_to_surface) -> pygame.Surface:
+        self._set_bgm("assets/menu_bgm.wav")
+        self.tracker.in_game = False
         game_p1 = self._clamp_p1(self.p1_pos)
         game_p2 = self._clamp_p2(self.p2_pos)
         base_bgr = self._compose_game_frame(frame, game_p1, game_p2)
@@ -676,6 +703,8 @@ class ColorWarApp:
         return surf
 
     def _handle_results(self, frame: np.ndarray, bgr_to_surface) -> pygame.Surface:
+        self._set_bgm("assets/menu_bgm.wav")
+        self.tracker.in_game = False
         res_bgr = cv2.addWeighted(frame, 0.3, self.engine.paint_canvas, 0.7, 0)
         surf = bgr_to_surface(res_bgr)
         action = self.ui.draw_results(
@@ -804,9 +833,12 @@ class ColorWarApp:
             self.challenges.draw_ball(blend, ball,
                                       self.engine.p1_color, self.engine.p2_color)
 
-        # Particles
+        # Particles (Glowing Orbs)
         for p in self.engine.particles:
-            cv2.circle(blend, (int(p[0]), int(p[1])), max(1, int(p[5] / 4)), p[4], -1)
+            r = max(1, int(p[5] / 3))
+            c = p[4]
+            cv2.circle(blend, (int(p[0]), int(p[1])), r + 2, c, -1)
+            cv2.circle(blend, (int(p[0]), int(p[1])), max(1, r - 1), (255, 255, 255), -1)
 
         # Fog (disabled but kept for interface consistency)
         blend = self.challenges.apply_fog(blend)
