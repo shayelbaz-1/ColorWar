@@ -130,14 +130,14 @@ OBSTACLE_REFRESH_SECONDS = 20
 # Pink paddle: hue ~138-172 (wider to catch angled/thin views), sat 90+ to reject skin
 PADDLE_HSV_PRIORS = {
     "CYAN": {"h_min": 75, "h_max": 105, "s_min": 100, "s_max": 255, "v_min": 80, "v_max": 255},
-    "PINK": {"h_min": 138, "h_max": 172, "s_min": 90, "s_max": 255, "v_min": 70, "v_max": 255},
+    "PINK": {"h_min": 135, "h_max": 175, "s_min": 75, "s_max": 255, "v_min": 60, "v_max": 255},
 }
 
 # Hard HSV floors — refinement / adaptation can NEVER go below these.
 # These prevent drift into skin tones (low-sat, wide-hue) or brown.
 HSV_FLOOR_CYAN  = {"s_min": 80,  "v_min": 60}
-HSV_FLOOR_PINK  = {"s_min": 85, "v_min": 55, "h_min": 133, "h_max": 178}
-# ^ pink s_min 85 (skin is <80), wider hue band to survive angled views
+HSV_FLOOR_PINK  = {"s_min": 70, "v_min": 50, "h_min": 130, "h_max": 179}
+# ^ pink s_min 70 (skin is <60-70 in some lights), wider hue band
 
 # HSV pre-processing
 HSV_BLUR_KSIZE = 5               # Gaussian blur kernel for noise suppression
