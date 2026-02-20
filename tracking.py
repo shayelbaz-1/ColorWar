@@ -239,9 +239,17 @@ class PaddleTracker:
     def p1_locked(self) -> bool:
         return self._state[True].locked
 
+    @p1_locked.setter
+    def p1_locked(self, value: bool):
+        self._state[True].locked = value
+
     @property
     def p2_locked(self) -> bool:
         return self._state[False].locked
+
+    @p2_locked.setter
+    def p2_locked(self, value: bool):
+        self._state[False].locked = value
 
     @property
     def both_locked(self) -> bool:
@@ -500,6 +508,56 @@ class PaddleTracker:
         center = np.array([cx, cy], dtype=float)
         return (contour, center, st.confidence)
 
+    def _refine_contour_watershed(self, frame_bgr: np.ndarray, contour: np.ndarray) -> np.ndarray:
+        """Refines the rough HSV contour using cv2.watershed for exact edges."""
+        if frame_bgr is None or contour is None:
+            return contour
+
+        x, y, w, h = cv2.boundingRect(contour)
+        PAD = 20
+        H, W = frame_bgr.shape[:2]
+        x1, y1 = max(0, x - PAD), max(0, y - PAD)
+        x2, y2 = min(W, x + w + PAD), min(H, y + h + PAD)
+        
+        if x2 - x1 < 5 or y2 - y1 < 5:
+            return contour
+
+        roi_bgr = frame_bgr[y1:y2, x1:x2].copy()
+        
+        local_contour = contour.copy()
+        local_contour[:, 0, 0] -= x1
+        local_contour[:, 0, 1] -= y1
+        
+        mask = np.zeros(roi_bgr.shape[:2], dtype=np.uint8)
+        cv2.drawContours(mask, [local_contour], -1, 255, -1)
+        
+        kernel = np.ones((5,5), np.uint8)
+        sure_fg = cv2.erode(mask, kernel, iterations=2)
+        sure_bg_mask = cv2.dilate(mask, kernel, iterations=3)
+        sure_bg = cv2.bitwise_not(sure_bg_mask)
+        
+        markers = np.zeros(roi_bgr.shape[:2], dtype=np.int32)
+        markers[sure_bg == 255] = 1
+        markers[sure_fg == 255] = 2
+        
+        try:
+            cv2.watershed(roi_bgr, markers)
+        except Exception:
+            return contour
+        
+        refined_mask = np.zeros(roi_bgr.shape[:2], dtype=np.uint8)
+        refined_mask[markers == 2] = 255
+        
+        refined_contours, _ = cv2.findContours(refined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not refined_contours:
+            return contour
+            
+        best_refined = max(refined_contours, key=cv2.contourArea)
+        best_refined[:, 0, 0] += x1
+        best_refined[:, 0, 1] += y1
+        
+        return best_refined
+
     # ------------------------------------------------------------------
     # Public tracking entry point (same signature as old tracker)
     # ------------------------------------------------------------------
@@ -518,6 +576,9 @@ class PaddleTracker:
             hsv_raw = hsv_blurred
 
         contour, center, conf = self._detect(hsv_raw, hsv_blurred, is_p1)
+        
+        if contour is not None and self._curr_bgr is not None:
+            contour = self._refine_contour_watershed(self._curr_bgr, contour)
 
         # Update position
         if conf >= CONFIDENCE_HOLD:

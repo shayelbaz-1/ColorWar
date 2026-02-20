@@ -3,6 +3,7 @@
 import cv2
 import numpy as np
 import time
+import pygame
 import threading
 import random
 
@@ -67,6 +68,7 @@ class ColorWarApp:
             pass
 
         self.state: str = STATE_AUTODETECT
+        self._calib_step: int = 0
 
         # Player positions and contours
         self.p1_pos = np.array([100, HEIGHT // 2], dtype=float)
@@ -351,14 +353,31 @@ class ColorWarApp:
     # Main loop
     # ------------------------------------------------------------------
     def run(self):
-        cv2.namedWindow("Color War Pong", cv2.WINDOW_NORMAL)
-        cv2.setWindowProperty("Color War Pong", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+        pygame.init()
+        screen = pygame.display.set_mode((WIDTH, HEIGHT), pygame.FULLSCREEN | pygame.SCALED)
+        pygame.display.set_caption("Color War Pong")
+        pygame.mouse.set_visible(False)
+        
+        try:
+            pygame.mixer.init()
+            import os
+            if os.path.exists("assets/bgm.mp3"):
+                pygame.mixer.music.load("assets/bgm.mp3")
+                pygame.mixer.music.set_volume(0.3)
+                pygame.mixer.music.play(-1)
+        except Exception:
+            pass
 
-        # Track which players were already locked to detect fresh lock events
-        _prev_p1_locked = False
-        _prev_p2_locked = False
+        clock = pygame.time.Clock()
+        self._calib_step = 0
+        running = True
 
-        while True:
+        # Helper to convert OpenCV BGR to Pygame Surface
+        def _bgr_to_surface(bgr) -> pygame.Surface:
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            return pygame.surfarray.make_surface(np.transpose(rgb, (1, 0, 2)))
+
+        while running:
             ret, frame = self.cap.read()
             if not ret:
                 break
@@ -371,17 +390,9 @@ class ColorWarApp:
 
             # --- Auto-detect / calibration phase ---
             if self.state == STATE_AUTODETECT:
-                self.tracker.calibrate_step(hsv, hsv_blurred)
+                # We no longer auto-calibrate, we wait for clicks.
+                surf = self._handle_autodetect(frame, hsv_blurred, _bgr_to_surface)
 
-                # Play lock sound on fresh locks
-                if self.tracker.p1_locked and not _prev_p1_locked:
-                    self._play_lock_sound()
-                if self.tracker.p2_locked and not _prev_p2_locked:
-                    self._play_lock_sound()
-                _prev_p1_locked = self.tracker.p1_locked
-                _prev_p2_locked = self.tracker.p2_locked
-
-                final = self._handle_autodetect(frame, hsv_blurred)
 
             else:
                 # --- Normal tracking (home, game, pause, results, replay) ---
@@ -399,38 +410,72 @@ class ColorWarApp:
                 self.tracker.adaptive_hsv_update(hsv, cnt2, is_p1=False)
 
                 if self.state == STATE_HOME:
-                    final = self._handle_home(frame)
+                    surf = self._handle_home(frame, _bgr_to_surface)
                 elif self.state == STATE_GAME:
-                    final = self._handle_game(frame)
+                    surf = self._handle_game(frame, _bgr_to_surface)
                 elif self.state == STATE_PAUSE:
-                    final = self._handle_pause(frame)
+                    surf = self._handle_pause(frame, _bgr_to_surface)
                 elif self.state == STATE_RESULTS:
-                    final = self._handle_results(frame)
+                    surf = self._handle_results(frame, _bgr_to_surface)
                 elif self.state == STATE_REPLAY:
-                    final = self._handle_replay()
+                    surf = self._handle_replay(_bgr_to_surface)
                 else:
-                    final = frame
+                    surf = _bgr_to_surface(frame)
 
             # End-of-frame bookkeeping
             self.tracker.end_frame()
 
-            cv2.imshow("Color War Pong", final)
-            self.tracker.show_debug_masks(hsv)
+            screen.blit(surf, (0, 0))
+            pygame.display.flip()
 
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord("q"):
-                break
-            elif key == ord("c") and self.state in (STATE_HOME, STATE_RESULTS):
-                # Quick re-enter calibration from home/results for fast iteration
-                self.tracker = PaddleTracker()
-                self._load_calibration_profile()
-                self.state = STATE_AUTODETECT
-                _prev_p1_locked = False
-                _prev_p2_locked = False
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_q or event.key == pygame.K_ESCAPE:
+                        running = False
+                    elif event.key == pygame.K_c and self.state in (STATE_HOME, STATE_RESULTS):
+                        # Quick re-enter calibration
+                        self.tracker = PaddleTracker()
+                        self._load_calibration_profile()
+                        self.state = STATE_AUTODETECT
+                        self._calib_step = 0
+                        
+                elif event.type == pygame.MOUSEBUTTONDOWN and self.state == STATE_AUTODETECT:
+                    x, y = event.pos
+                    x = max(0, min(WIDTH-1, x))
+                    y = max(0, min(HEIGHT-1, y))
+                    clicked_hsv = hsv_blurred[y, x]
+                    h, s, v = clicked_hsv
+                    
+                    if self._calib_step == 0:
+                        # Set Cyan (P1)
+                        self.tracker._state[True].h_min = max(0, int(h) - 15)
+                        self.tracker._state[True].h_max = min(179, int(h) + 15)
+                        self.tracker._state[True].s_min = max(40, int(s) - 50)
+                        self.tracker._state[True].s_max = 255
+                        self.tracker._state[True].v_min = max(40, int(v) - 50)
+                        self.tracker._state[True].v_max = 255
+                        self.tracker.p1_locked = True
+                        self._calib_step = 1
+                        self._play_lock_sound()
+                    elif self._calib_step == 1:
+                        # Set Pink (P2)
+                        self.tracker._state[False].h_min = max(0, int(h) - 15)
+                        self.tracker._state[False].h_max = min(179, int(h) + 15)
+                        self.tracker._state[False].s_min = max(40, int(s) - 50)
+                        self.tracker._state[False].s_max = 255
+                        self.tracker._state[False].v_min = max(40, int(v) - 50)
+                        self.tracker._state[False].v_max = 255
+                        self.tracker.p2_locked = True
+                        self._calib_step = 2
+                        self._play_lock_sound()
+            
+            clock.tick(60)
 
         self.tracker.close()
         self.cap.release()
-        cv2.destroyAllWindows()
+        pygame.quit()
 
     # ------------------------------------------------------------------
     # Midline helpers
@@ -458,33 +503,31 @@ class ColorWarApp:
     # ------------------------------------------------------------------
     # State handlers
     # ------------------------------------------------------------------
-    def _handle_autodetect(self, frame: np.ndarray, hsv_blurred: np.ndarray) -> np.ndarray:
-        """Draw calibration overlay and transition to home when both paddles are locked."""
-        self.ui.draw_calibration(
-            frame,
-            self.tracker.calibration_progress(True),
-            self.tracker.calibration_progress(False),
-            self.tracker.p1_locked,
-            self.tracker.p2_locked,
-        )
+    def _handle_autodetect(self, frame: np.ndarray, hsv_blurred: np.ndarray, bgr_to_surface) -> pygame.Surface:
+        """Draw interactive click-to-calibrate screen."""
+        surf = bgr_to_surface(frame)
+        self.ui.draw_click_calibration(surf, self._calib_step)
 
-        if self.tracker.both_locked:
-            # Set fixed player colours
+        if self._calib_step == 2:
             self.ui.p1_color = COLOR_P1
             self.ui.p2_color = COLOR_P2
             self.engine.set_player_colors(COLOR_P1, COLOR_P2, "CYAN", "PINK")
             self.state = STATE_HOME
             self.ui.reset_hover_states()
+            pygame.mouse.set_visible(False)
+        else:
+            pygame.mouse.set_visible(True)
 
-        return frame
+        return surf
 
-    def _handle_home(self, frame: np.ndarray) -> np.ndarray:
-        action = self.ui.draw_home(frame, self.p1_pos, self.p2_pos)
+    def _handle_home(self, frame: np.ndarray, bgr_to_surface) -> pygame.Surface:
+        surf = bgr_to_surface(frame)
+        action = self.ui.draw_home(surf, self.p1_pos, self.p2_pos)
         if action == "start":
             self._start_game()
-        return frame
+        return surf
 
-    def _handle_game(self, frame: np.ndarray) -> np.ndarray:
+    def _handle_game(self, frame: np.ndarray, bgr_to_surface) -> pygame.Surface:
         in_prestart = self.engine.in_prestart
 
         # Record raw camera frame for timelapse (skip prestart)
@@ -522,7 +565,14 @@ class ColorWarApp:
             self._pause_start = time.time()
             self.state = STATE_PAUSE
             self.ui.reset_hover_states()
-            return self._compose_game_frame(frame, game_p1, game_p2)
+            base_bgr = self._compose_game_frame(frame, game_p1, game_p2)
+            surf = bgr_to_surface(base_bgr)
+            self.ui.draw_hud(surf, self.engine.time_left, self.ui.selected_difficulty,
+                             self.engine.level, self.engine.level_up_until,
+                             combo_count=self.engine.combo_count, combo_owner=self.engine.combo_owner,
+                             combo_banner_until=self.engine.combo_banner_until,
+                             p1_color=self.engine.p1_color, p2_color=self.engine.p2_color)
+            return surf
 
         # Contours for collision — only pass trusted contours
         p1_cnt = (self.p1_contour
@@ -561,13 +611,37 @@ class ColorWarApp:
             self.state = STATE_RESULTS
             self.ui.reset_hover_states()
 
-        return self._compose_game_frame(frame, game_p1, game_p2)
+        base_bgr = self._compose_game_frame(frame, game_p1, game_p2)
+        surf = bgr_to_surface(base_bgr)
+        self.ui.draw_hud(surf, self.engine.time_left, self.ui.selected_difficulty,
+                         self.engine.level, self.engine.level_up_until,
+                         combo_count=self.engine.combo_count, combo_owner=self.engine.combo_owner,
+                         combo_banner_until=self.engine.combo_banner_until,
+                         p1_color=self.engine.p1_color, p2_color=self.engine.p2_color)
 
-    def _handle_pause(self, frame: np.ndarray) -> np.ndarray:
+        if self.ui.pause_hold_start is not None:
+            self.ui.draw_pause_progress(surf)
+
+        # Pre-start countdown overlay and hints
+        if in_prestart:
+            self.ui.draw_prestart(surf, self.engine.prestart_until)
+        elif time.time() < self._help_show_until:
+            self.ui.draw_hints(surf, self._help_show_until)
+
+        return surf
+
+    def _handle_pause(self, frame: np.ndarray, bgr_to_surface) -> pygame.Surface:
         game_p1 = self._clamp_p1(self.p1_pos)
         game_p2 = self._clamp_p2(self.p2_pos)
-        game_frame = self._compose_game_frame(frame, game_p1, game_p2)
-        action = self.ui.draw_pause(game_frame, self.p1_pos, self.p2_pos)
+        base_bgr = self._compose_game_frame(frame, game_p1, game_p2)
+        surf = bgr_to_surface(base_bgr)
+        self.ui.draw_hud(surf, self.engine.time_left, self.ui.selected_difficulty,
+                         self.engine.level, self.engine.level_up_until,
+                         combo_count=self.engine.combo_count, combo_owner=self.engine.combo_owner,
+                         combo_banner_until=self.engine.combo_banner_until,
+                         p1_color=self.engine.p1_color, p2_color=self.engine.p2_color)
+
+        action = self.ui.draw_pause(surf, self.p1_pos, self.p2_pos)
 
         if action == "resume":
             paused = time.time() - self._pause_start
@@ -599,12 +673,13 @@ class ColorWarApp:
             self.state = STATE_HOME
             self.ui.reset_hover_states()
 
-        return game_frame
+        return surf
 
-    def _handle_results(self, frame: np.ndarray) -> np.ndarray:
-        action, res_frame = self.ui.draw_results(
-            frame,
-            self.engine.paint_canvas,
+    def _handle_results(self, frame: np.ndarray, bgr_to_surface) -> pygame.Surface:
+        res_bgr = cv2.addWeighted(frame, 0.3, self.engine.paint_canvas, 0.7, 0)
+        surf = bgr_to_surface(res_bgr)
+        action = self.ui.draw_results(
+            surf,
             self.engine.winner_text,
             self.engine.p1_score_pct,
             self.engine.p2_score_pct,
@@ -618,7 +693,7 @@ class ColorWarApp:
         elif action == "home":
             self.state = STATE_HOME
             self.ui.reset_hover_states()
-        return res_frame
+        return surf
 
     # ------------------------------------------------------------------
     # Timelapse replay
@@ -634,27 +709,12 @@ class ColorWarApp:
         est_fps = 30.0
         self._replay_step = total / (REPLAY_DURATION * est_fps)
 
-    def _handle_replay(self) -> np.ndarray:
+    def _handle_replay(self, bgr_to_surface) -> pygame.Surface:
         total = len(self._replay_frames)
         idx = min(int(self._replay_playback_idx), total - 1)
         replay_frame = self._replay_frames[idx].copy()
-
-        # Progress bar
-        progress = (idx + 1) / total
-        bar_h = 8
-        bar_y = HEIGHT - bar_h - 4
-        cv2.rectangle(replay_frame, (10, bar_y), (WIDTH - 10, bar_y + bar_h),
-                       COLOR_GRAY, -1)
-        fill_w = int((WIDTH - 20) * progress)
-        cv2.rectangle(replay_frame, (10, bar_y), (10 + fill_w, bar_y + bar_h),
-                       COLOR_WHITE, -1)
-
-        cv2.putText(replay_frame, "REPLAY", (15, 30),
-                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2)
-
-        speed_label = f"{total / (REPLAY_DURATION * 30):.1f}x"
-        cv2.putText(replay_frame, speed_label, (WIDTH - 80, 30),
-                     cv2.FONT_HERSHEY_PLAIN, 1.2, COLOR_WHITE, 1)
+        surf = bgr_to_surface(replay_frame)
+        self.ui.draw_replay_hud(surf, idx, total)
 
         self._replay_playback_idx += self._replay_step
 
@@ -662,7 +722,7 @@ class ColorWarApp:
             self.state = STATE_RESULTS
             self.ui.reset_hover_states()
 
-        return replay_frame
+        return surf
 
     # ------------------------------------------------------------------
     # Game-frame compositor
@@ -750,55 +810,6 @@ class ColorWarApp:
 
         # Fog (disabled but kept for interface consistency)
         blend = self.challenges.apply_fog(blend)
-
-        # HUD
-        self.ui.draw_hud(blend, self.engine.time_left, self.ui.selected_difficulty,
-                         self.engine.level, self.engine.level_up_until,
-                         combo_count=self.engine.combo_count,
-                         combo_owner=self.engine.combo_owner,
-                         combo_banner_until=self.engine.combo_banner_until,
-                         p1_color=self.engine.p1_color,
-                         p2_color=self.engine.p2_color)
-
-        # Pause gesture progress
-        if self.ui.pause_hold_start is not None:
-            prog = (time.time() - self.ui.pause_hold_start) / PAUSE_HOLD_DURATION
-            cv2.putText(blend, f"Pausing... {int(prog * 100)}%",
-                         (WIDTH // 2 - 70, HEIGHT - 20),
-                         cv2.FONT_HERSHEY_PLAIN, 1.2, COLOR_WHITE, 1)
-
-        # Pre-start countdown overlay
-        now = time.time()
-        if in_prestart:
-            remaining = max(0, self.engine.prestart_until - now)
-            overlay = blend.copy()
-            cv2.rectangle(overlay, (WIDTH // 2 - 130, HEIGHT // 2 - 40),
-                           (WIDTH // 2 + 130, HEIGHT // 2 + 50), COLOR_BLACK, -1)
-            cv2.addWeighted(overlay, 0.65, blend, 0.35, 0, blend)
-            cv2.putText(blend, f"GET READY  {int(remaining) + 1}",
-                         (WIDTH // 2 - 110, HEIGHT // 2),
-                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, COLOR_WHITE, 2)
-            cv2.putText(blend, "Stay on your side!",
-                         (WIDTH // 2 - 90, HEIGHT // 2 + 35),
-                         cv2.FONT_HERSHEY_PLAIN, 1.2, (0, 200, 255), 1)
-
-        elif now < self._help_show_until:
-            fade = min(1.0, (self._help_show_until - now) / 2.0)
-            overlay = blend.copy()
-            cv2.rectangle(overlay, (WIDTH // 2 - 160, HEIGHT // 2 - 60),
-                           (WIDTH // 2 + 160, HEIGHT // 2 + 70), COLOR_BLACK, -1)
-            cv2.addWeighted(overlay, 0.7 * fade, blend, 1.0 - 0.7 * fade, 0, blend)
-            alpha_col = tuple(int(c * fade) for c in COLOR_WHITE)
-            hints = [
-                "Hit the ball to paint the arena!",
-                "Hold BOTH paddles at TOP to pause",
-                "Most paint coverage wins",
-                "Q = Quit",
-            ]
-            for i, txt in enumerate(hints):
-                cv2.putText(blend, txt,
-                             (WIDTH // 2 - 145, HEIGHT // 2 - 35 + i * 28),
-                             cv2.FONT_HERSHEY_PLAIN, 1.1, alpha_col, 1)
 
         # Screen shake
         blend = self._apply_shake(blend)
