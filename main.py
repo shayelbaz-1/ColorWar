@@ -6,6 +6,7 @@ import time
 import pygame
 import threading
 import random
+import math
 
 from .config import (
     WIDTH,
@@ -88,6 +89,9 @@ class ColorWarApp:
         # Pre-start warning state
         self._p1_was_wrong_side: bool = False
         self._p2_was_wrong_side: bool = False
+
+        # Dynamic side assignment (True = P1 is left, False = P1 is right)
+        self._p1_is_left: bool = True
 
         # Audio scheduler state
         self._next_progress_beep: float = 0.0
@@ -356,6 +360,8 @@ class ColorWarApp:
         diff = self.ui.selected_difficulty
         self.challenges.configure(diff)
         self.engine.reset(self.challenges.speed_multiplier)
+        # Dynamic side assignment based on current paddle positions
+        self._p1_is_left = self.p1_pos[0] <= self.p2_pos[0]
         self.state = STATE_GAME
         self.ui.reset_hover_states()
         self._help_show_until = time.time() + 4.0
@@ -494,25 +500,31 @@ class ColorWarApp:
     # ------------------------------------------------------------------
     # Midline helpers
     # ------------------------------------------------------------------
-    @staticmethod
-    def _clamp_p1(pos):
+    def _clamp_p1(self, pos):
         clamped = pos.copy()
-        clamped[0] = min(clamped[0], WIDTH // 2 - PADDLE_RADIUS)
+        if self._p1_is_left:
+            clamped[0] = min(clamped[0], WIDTH // 2 - PADDLE_RADIUS)
+        else:
+            clamped[0] = max(clamped[0], WIDTH // 2 + PADDLE_RADIUS)
         return clamped
 
-    @staticmethod
-    def _clamp_p2(pos):
+    def _clamp_p2(self, pos):
         clamped = pos.copy()
-        clamped[0] = max(clamped[0], WIDTH // 2 + PADDLE_RADIUS)
+        if self._p1_is_left:
+            clamped[0] = max(clamped[0], WIDTH // 2 + PADDLE_RADIUS)
+        else:
+            clamped[0] = min(clamped[0], WIDTH // 2 - PADDLE_RADIUS)
         return clamped
 
-    @staticmethod
-    def _is_p1_wrong_side(pos) -> bool:
-        return pos[0] > WIDTH // 2
-
-    @staticmethod
-    def _is_p2_wrong_side(pos) -> bool:
+    def _is_p1_wrong_side(self, pos) -> bool:
+        if self._p1_is_left:
+            return pos[0] > WIDTH // 2
         return pos[0] < WIDTH // 2
+
+    def _is_p2_wrong_side(self, pos) -> bool:
+        if self._p1_is_left:
+            return pos[0] < WIDTH // 2
+        return pos[0] > WIDTH // 2
 
     # ------------------------------------------------------------------
     # State handlers
@@ -599,22 +611,30 @@ class ColorWarApp:
             return surf
 
         # Contours for collision — only pass trusted contours
+        p1_wrong_now = self._is_p1_wrong_side(self.p1_pos)
+        p2_wrong_now = self._is_p2_wrong_side(self.p2_pos)
         p1_cnt = (self.p1_contour
                   if self.p1_contour is not None
-                  and not self._is_p1_wrong_side(self.p1_pos)
+                  and not p1_wrong_now
                   and p1_conf >= TRACKING_CONFIDENCE_MIN
                   else None)
         p2_cnt = (self.p2_contour
                   if self.p2_contour is not None
-                  and not self._is_p2_wrong_side(self.p2_pos)
+                  and not p2_wrong_now
                   and p2_conf >= TRACKING_CONFIDENCE_MIN
                   else None)
+
+        # Move collision position off-screen when on wrong side
+        # so the circle fallback in game.py also can't trigger
+        OFF_SCREEN = np.array([-9999.0, -9999.0])
+        col_p1 = OFF_SCREEN if p1_wrong_now else game_p1
+        col_p2 = OFF_SCREEN if p2_wrong_now else game_p2
 
         obstacles = self.challenges.obstacles if self.challenges.obstacles_enabled else None
         
         self.challenges.update(self.engine)
         still_running = self.engine.update(
-            game_p1, game_p2, self.p1_prev, self.p2_prev, obstacles,
+            col_p1, col_p2, self.p1_prev, self.p2_prev, obstacles,
             p1_contour=p1_cnt, p2_contour=p2_cnt,
         )
 
@@ -819,14 +839,46 @@ class ColorWarApp:
         else:
             cv2.circle(blend, (int(game_p2[0]), int(game_p2[1])), PADDLE_RADIUS, p2_draw_col, 3)
 
-        # Ghost circles when on wrong side (post-prestart)
+        # Pulsating wrong-side warning overlay
         if not in_prestart:
-            if p1_wrong:
-                cv2.circle(blend, (int(self.p1_pos[0]), int(self.p1_pos[1])),
-                           PADDLE_RADIUS, COLOR_GRAY, 2)
-            if p2_wrong:
-                cv2.circle(blend, (int(self.p2_pos[0]), int(self.p2_pos[1])),
-                           PADDLE_RADIUS, COLOR_GRAY, 2)
+            pulse = abs(math.sin(time.time() * 5))  # 0..1 pulsating
+            for is_wrong, player_pos in [(p1_wrong, self.p1_pos), (p2_wrong, self.p2_pos)]:
+                if not is_wrong:
+                    continue
+                # Draw warning on the player's OWN/CORRECT side (to alert them to come back)
+                px = int(player_pos[0])
+                on_left_half = px >= WIDTH // 2  # player IS on right → their side is LEFT
+                # Red/orange glow overlay on the affected half
+                overlay = blend.copy()
+                alpha = 0.08 + 0.12 * pulse  # subtle pulsating transparency
+                if on_left_half:
+                    cv2.rectangle(overlay, (0, 0), (WIDTH // 2, HEIGHT), (0, 0, 200), -1)
+                    text_cx = WIDTH // 4
+                else:
+                    cv2.rectangle(overlay, (WIDTH // 2, 0), (WIDTH, HEIGHT), (0, 0, 200), -1)
+                    text_cx = 3 * WIDTH // 4
+                cv2.addWeighted(overlay, alpha, blend, 1.0 - alpha, 0, blend)
+                # Pulsating border stripe
+                bx = WIDTH // 2 - 2 if on_left_half else WIDTH // 2
+                border_alpha = 0.3 + 0.5 * pulse
+                border_overlay = blend.copy()
+                cv2.rectangle(border_overlay, (bx, 0), (bx + 4, HEIGHT), (0, 80, 255), -1)
+                cv2.addWeighted(border_overlay, border_alpha, blend, 1.0 - border_alpha, 0, blend)
+                # "WRONG SIDE!" text with glow
+                txt = "WRONG SIDE!"
+                font_scale = 0.55 + 0.1 * pulse
+                thickness = 2
+                (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+                tx = text_cx - tw // 2
+                ty = HEIGHT // 2 + th // 2
+                # Glow behind text
+                for gx, gy in [(-2, -2), (-2, 2), (2, -2), (2, 2), (0, -2), (0, 2), (-2, 0), (2, 0)]:
+                    cv2.putText(blend, txt, (tx + gx, ty + gy),
+                                cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 100), thickness + 1)
+                # Main text
+                glow_intensity = int(200 + 55 * pulse)
+                cv2.putText(blend, txt, (tx, ty),
+                            cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, glow_intensity // 4, glow_intensity), thickness)
 
         # Balls
         for ball in self.engine.balls:

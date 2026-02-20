@@ -157,7 +157,7 @@ class UIManager:
         self.home_buttons: dict[str, HoverButton] = {
             "start": HoverButton(cx, 160, btn_w, btn_h, "START GAME", (0, 200, 0)),
         }
-        diff_y = 280
+        diff_y = 310
         diff_w = 120
         diff_colors = [(0, 200, 0), (0, 200, 200), (0, 100, 255), (0, 0, 255)]
         self.diff_buttons: dict[str, HoverButton] = {}
@@ -166,7 +166,7 @@ class UIManager:
             self.diff_buttons[f"diff_{i}"] = HoverButton(x, diff_y, diff_w, 40, name, diff_colors[i])
 
         self.home_buttons["toggle_diff"] = HoverButton(
-            WIDTH // 2 - 90, 230, 180, 35, "CHANGE DIFFICULTY", (0, 140, 180),
+            WIDTH // 2 - 100, 230, 200, 35, "DIFFICULTY", (0, 140, 180),
         )
 
         self.selected_difficulty: int = 0
@@ -181,9 +181,9 @@ class UIManager:
         }
 
         self.result_buttons: dict[str, HoverButton] = {
-            "replay":     HoverButton(cx, 300, btn_w, btn_h, "WATCH REPLAY", (0, 100, 200)),
-            "play_again": HoverButton(cx, 370, btn_w, btn_h, "PLAY AGAIN",   (0, 200, 0)),
-            "home":       HoverButton(cx, 440, btn_w, btn_h, "HOME MENU",    (255, 100, 0)),
+            "replay":     HoverButton(cx, 260, btn_w, 42, "WATCH REPLAY", (0, 100, 200)),
+            "play_again": HoverButton(cx, 315, btn_w, 42, "PLAY AGAIN",   (0, 200, 0)),
+            "home":       HoverButton(cx, 370, btn_w, 42, "HOME MENU",    (255, 100, 0)),
         }
 
         self.p1_color: tuple = COLOR_P1
@@ -254,13 +254,15 @@ class UIManager:
         over.fill((0, 0, 0, 140))
         surface.blit(over, (0, 0))
 
-        self._draw_centered_text(surface, "CALIBRATION", 60, FONT_TITLE, COLOR_WHITE)
+        self._draw_centered_text(surface, "CALIBRATION", 60, FONT_LARGE, COLOR_WHITE)
         
         if step == 0:
-            self._draw_centered_text(surface, "Click anywhere on the CYAN paddle", 200, FONT_LARGE, self.p1_color)
+            self._draw_centered_text(surface, "Click on the", 170, FONT_MEDIUM, COLOR_WHITE)
+            self._draw_centered_text(surface, "CYAN PADDLE", 200, FONT_LARGE, self.p1_color)
             UIManager._draw_glowing_cursor(surface, pygame.mouse.get_pos(), self.p1_color, 10)
         elif step == 1:
-            self._draw_centered_text(surface, "Click anywhere on the PINK paddle", 200, FONT_LARGE, self.p2_color)
+            self._draw_centered_text(surface, "Click on the", 170, FONT_MEDIUM, COLOR_WHITE)
+            self._draw_centered_text(surface, "PINK PADDLE", 200, FONT_LARGE, self.p2_color)
             UIManager._draw_glowing_cursor(surface, pygame.mouse.get_pos(), self.p2_color, 10)
 
     def draw_home(self, surface: pygame.Surface, p1_pos, p2_pos) -> str | None:
@@ -277,7 +279,7 @@ class UIManager:
         self._draw_centered_text(surface, "COLOR WAR", 60, FONT_TITLE, base_color, c2, 1)
         
         self._draw_centered_text(surface, "Hover paddle over button to select", 130, FONT_SMALL, COLOR_GRAY)
-        self._draw_centered_text(surface, f"Difficulty:{DIFFICULTY_NAMES[self.selected_difficulty]}", 260, FONT_MEDIUM, COLOR_WHITE)
+        self._draw_centered_text(surface, f"{DIFFICULTY_NAMES[self.selected_difficulty]}", 280, FONT_SMALL, COLOR_WHITE)
 
         positions = [p1_pos, p2_pos]
         action = None
@@ -336,14 +338,15 @@ class UIManager:
         surface.blit(over, (80, 40))
         pygame.draw.rect(surface, to_rgb(COLOR_WHITE)[:3], (80, 40, WIDTH - 160, HEIGHT - 80), 3)
 
-        self._draw_centered_text(surface, winner_text, 70, FONT_TITLE, COLOR_WHITE)
+        self._draw_centered_text(surface, winner_text, 55, FONT_LARGE, COLOR_WHITE)
 
-        bar_w = 300
-        self._outlined_text(surface, f"P1: {p1_pct}%", (120, 150), FONT_LARGE, self.p1_color)
-        pygame.draw.rect(surface, to_rgb(self.p1_color)[:3], (120, 200, int(p1_pct / 100 * bar_w), 25))
+        bar_w = 260
+        bar_x = 130
+        self._outlined_text(surface, f"P1: {p1_pct}%", (bar_x, 100), FONT_MEDIUM, self.p1_color)
+        pygame.draw.rect(surface, to_rgb(self.p1_color)[:3], (bar_x, 125, int(p1_pct / 100 * bar_w), 18))
         
-        self._outlined_text(surface, f"P2: {p2_pct}%", (120, 230), FONT_LARGE, self.p2_color)
-        pygame.draw.rect(surface, to_rgb(self.p2_color)[:3], (120, 280, int(p2_pct / 100 * bar_w), 25))
+        self._outlined_text(surface, f"P2: {p2_pct}%", (bar_x, 150), FONT_MEDIUM, self.p2_color)
+        pygame.draw.rect(surface, to_rgb(self.p2_color)[:3], (bar_x, 175, int(p2_pct / 100 * bar_w), 18))
 
         positions = [p1_pos, p2_pos]
         action = None
