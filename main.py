@@ -410,8 +410,7 @@ class ColorWarApp:
 
             # --- Auto-detect / calibration phase ---
             if self.state == STATE_AUTODETECT:
-                # We no longer auto-calibrate, we wait for clicks.
-                surf = self._handle_autodetect(frame, hsv_blurred, _bgr_to_surface)
+                surf = self._handle_autodetect(frame, hsv, hsv_blurred, _bgr_to_surface)
 
 
             else:
@@ -461,35 +460,7 @@ class ColorWarApp:
                         self.state = STATE_AUTODETECT
                         self._calib_step = 0
                         
-                elif event.type == pygame.MOUSEBUTTONDOWN and self.state == STATE_AUTODETECT:
-                    x, y = event.pos
-                    x = max(0, min(WIDTH-1, x))
-                    y = max(0, min(HEIGHT-1, y))
-                    clicked_hsv = hsv_blurred[y, x]
-                    h, s, v = clicked_hsv
-                    
-                    if self._calib_step == 0:
-                        # Set Cyan (P1)
-                        self.tracker._state[True].h_min = max(0, int(h) - 15)
-                        self.tracker._state[True].h_max = min(179, int(h) + 15)
-                        self.tracker._state[True].s_min = max(40, int(s) - 50)
-                        self.tracker._state[True].s_max = 255
-                        self.tracker._state[True].v_min = max(40, int(v) - 50)
-                        self.tracker._state[True].v_max = 255
-                        self.tracker.p1_locked = True
-                        self._calib_step = 1
-                        self._play_lock_sound()
-                    elif self._calib_step == 1:
-                        # Set Pink (P2)
-                        self.tracker._state[False].h_min = max(0, int(h) - 15)
-                        self.tracker._state[False].h_max = min(179, int(h) + 15)
-                        self.tracker._state[False].s_min = max(40, int(s) - 50)
-                        self.tracker._state[False].s_max = 255
-                        self.tracker._state[False].v_min = max(40, int(v) - 50)
-                        self.tracker._state[False].v_max = 255
-                        self.tracker.p2_locked = True
-                        self._calib_step = 2
-                        self._play_lock_sound()
+
             
             clock.tick(60)
 
@@ -529,20 +500,34 @@ class ColorWarApp:
     # ------------------------------------------------------------------
     # State handlers
     # ------------------------------------------------------------------
-    def _handle_autodetect(self, frame: np.ndarray, hsv_blurred: np.ndarray, bgr_to_surface) -> pygame.Surface:
-        """Draw interactive click-to-calibrate screen."""
-        surf = bgr_to_surface(frame)
-        self.ui.draw_click_calibration(surf, self._calib_step)
+    def _handle_autodetect(self, frame: np.ndarray, hsv: np.ndarray, hsv_blurred: np.ndarray, bgr_to_surface) -> pygame.Surface:
+        """Automatic paddle detection using motion + color fusion."""
+        # Run auto-calibration every frame
+        self.tracker.calibrate_step(hsv, hsv_blurred)
 
-        if self._calib_step == 2:
+        p1_progress = self.tracker.calibration_progress(is_p1=True)
+        p2_progress = self.tracker.calibration_progress(is_p1=False)
+        p1_locked = self.tracker.p1_locked
+        p2_locked = self.tracker.p2_locked
+
+        # Play lock sound on transitions
+        if p1_locked and self._calib_step == 0:
+            self._calib_step = 1
+            self._play_lock_sound()
+        if p2_locked and self._calib_step < 2:
+            self._calib_step = 2
+            self._play_lock_sound()
+
+        surf = bgr_to_surface(frame)
+        self.ui.draw_auto_calibration(surf, p1_progress, p2_progress, p1_locked, p2_locked)
+
+        if p1_locked and p2_locked:
             self.ui.p1_color = COLOR_P1
             self.ui.p2_color = COLOR_P2
             self.engine.set_player_colors(COLOR_P1, COLOR_P2, "CYAN", "PINK")
             self.state = STATE_HOME
             self.ui.reset_hover_states()
             pygame.mouse.set_visible(False)
-        else:
-            pygame.mouse.set_visible(True)
 
         return surf
 

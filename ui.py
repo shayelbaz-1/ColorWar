@@ -250,20 +250,57 @@ class UIManager:
         UIManager._outlined_text(surface, text, (x, y), font, color, outline_color, outline_thickness)
 
     def draw_click_calibration(self, surface: pygame.Surface, step: int) -> None:
+        """Legacy click calibration — kept for compatibility."""
+        self.draw_auto_calibration(surface, 0.0, 0.0, False, False)
+
+    def draw_auto_calibration(self, surface: pygame.Surface,
+                               p1_progress: float, p2_progress: float,
+                               p1_locked: bool, p2_locked: bool) -> None:
         over = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
         over.fill((0, 0, 0, 140))
         surface.blit(over, (0, 0))
 
-        self._draw_centered_text(surface, "CALIBRATION", 60, FONT_LARGE, COLOR_WHITE)
-        
-        if step == 0:
-            self._draw_centered_text(surface, "Click on the", 170, FONT_MEDIUM, COLOR_WHITE)
-            self._draw_centered_text(surface, "CYAN PADDLE", 200, FONT_LARGE, self.p1_color)
-            UIManager._draw_glowing_cursor(surface, pygame.mouse.get_pos(), self.p1_color, 10)
-        elif step == 1:
-            self._draw_centered_text(surface, "Click on the", 170, FONT_MEDIUM, COLOR_WHITE)
-            self._draw_centered_text(surface, "PINK PADDLE", 200, FONT_LARGE, self.p2_color)
-            UIManager._draw_glowing_cursor(surface, pygame.mouse.get_pos(), self.p2_color, 10)
+        self._draw_centered_text(surface, "DETECTING PADDLES", 50, FONT_LARGE, COLOR_WHITE)
+        self._draw_centered_text(surface, "Wave your paddles!", 100, FONT_MEDIUM, COLOR_WHITE)
+
+        # Progress bars
+        bar_w = 260
+        bar_h = 24
+        bar_x = WIDTH // 2 - bar_w // 2
+
+        # --- Cyan (P1) ---
+        cy = 170
+        label = "CYAN  ✓" if p1_locked else "CYAN"
+        label_col = (0, 255, 100) if p1_locked else to_rgb(self.p1_color)
+        self._draw_centered_text(surface, label, cy - 10, FONT_MEDIUM, label_col)
+        # Bar background
+        pygame.draw.rect(surface, (50, 50, 50), (bar_x, cy + 10, bar_w, bar_h), border_radius=6)
+        # Bar fill
+        fill_w = int(bar_w * p1_progress)
+        if fill_w > 0:
+            fill_col = (0, 255, 100) if p1_locked else to_rgb(self.p1_color)
+            pygame.draw.rect(surface, fill_col, (bar_x, cy + 10, fill_w, bar_h), border_radius=6)
+        # Bar border
+        pygame.draw.rect(surface, (200, 200, 200), (bar_x, cy + 10, bar_w, bar_h), 2, border_radius=6)
+
+        # --- Pink (P2) ---
+        py_ = 260
+        label = "PINK  ✓" if p2_locked else "PINK"
+        label_col = (0, 255, 100) if p2_locked else to_rgb(self.p2_color)
+        self._draw_centered_text(surface, label, py_ - 10, FONT_MEDIUM, label_col)
+        # Bar background
+        pygame.draw.rect(surface, (50, 50, 50), (bar_x, py_ + 10, bar_w, bar_h), border_radius=6)
+        # Bar fill
+        fill_w = int(bar_w * p2_progress)
+        if fill_w > 0:
+            fill_col = (0, 255, 100) if p2_locked else to_rgb(self.p2_color)
+            pygame.draw.rect(surface, fill_col, (bar_x, py_ + 10, fill_w, bar_h), border_radius=6)
+        # Bar border
+        pygame.draw.rect(surface, (200, 200, 200), (bar_x, py_ + 10, bar_w, bar_h), 2, border_radius=6)
+
+        # Pulsating hint at the bottom
+        pulse = int(100 + 80 * abs(math.sin(time.time() * 3)))
+        self._draw_centered_text(surface, "Move paddles so we can find them", 380, FONT_SMALL, (pulse, pulse, pulse))
 
     def draw_home(self, surface: pygame.Surface, p1_pos, p2_pos) -> str | None:
         over = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)

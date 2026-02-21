@@ -855,6 +855,9 @@ class PaddleTracker:
                 continue
 
             mask = self._get_mask(hsv_blurred, is_p1)
+            # Fuse with motion mask: only consider MOVING colored blobs
+            if self._motion_mask is not None:
+                mask = cv2.bitwise_and(mask, self._motion_mask)
             contours, _ = cv2.findContours(
                 mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
             )
