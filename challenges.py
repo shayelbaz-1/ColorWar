@@ -125,16 +125,28 @@ class ChallengeManager:
         else:
             b_col = COLOR_WHITE
 
-        # Draw with potential transparency
+        # Colored glowing aura (two layers)
+        aura1 = int(BALL_RADIUS * 1.8)
+        aura2 = int(BALL_RADIUS * 1.4)
+        overlay = frame.copy()
+        cv2.circle(overlay, (bx, by), aura1, b_col, -1)
+        cv2.addWeighted(overlay, 0.15, frame, 0.85, 0, frame)
+        
+        overlay = frame.copy()
+        cv2.circle(overlay, (bx, by), aura2, b_col, -1)
+        cv2.addWeighted(overlay, 0.30, frame, 0.70, 0, frame)
+
+        # Draw main solid body with potential transparency
         if hasattr(ball, "alpha") and ball.alpha < 1.0:
-            overlay = frame.copy()
-            cv2.circle(overlay, (bx, by), BALL_RADIUS, b_col, -1)
-            cv2.addWeighted(overlay, ball.alpha, frame, 1.0 - ball.alpha, 0, frame)
+            overlay2 = frame.copy()
+            cv2.circle(overlay2, (bx, by), BALL_RADIUS, b_col, -1)
+            cv2.addWeighted(overlay2, ball.alpha, frame, 1.0 - ball.alpha, 0, frame)
         else:
             cv2.circle(frame, (bx, by), BALL_RADIUS, b_col, -1)
 
-        # Border ring
-        cv2.circle(frame, (bx, by), BALL_RADIUS, b_col, 2)
+        # High-contrast border (outer black, inner white) to pop against any background
+        cv2.circle(frame, (bx, by), BALL_RADIUS + 1, (0, 0, 0), 2)
+        cv2.circle(frame, (bx, by), BALL_RADIUS, (255, 255, 255), 1)
 
     def draw_obstacles(self, frame: np.ndarray):
         """Draw all active obstacle rectangles."""
