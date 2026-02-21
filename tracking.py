@@ -32,8 +32,7 @@ from .config import (
     HSV_BLUR_KSIZE,
     HSV_REFINE_HUE_TOL,
     HSV_REFINE_SV_TOL,
-    HSV_ADAPTIVE_INTERVAL,
-    HSV_ADAPTIVE_BLEND,
+
     CALIB_LOCK_FRAMES,
     CALIB_LOCK_DECAY,
     PINK_CALIB_SAT_MIN,
@@ -51,10 +50,7 @@ from .config import (
     EDGE_CANNY_LOW,
     EDGE_CANNY_HIGH,
     EMA_ALPHA,
-    DETECT_USE_MOTION_MASK,
-    MOTION_MASK_LEARNING_RATE,
-    MOTION_MASK_MIN_OVERLAP,
-    MOTION_PENALTY_MULT,
+
     # Hysteresis gate
     CONFIDENCE_HOLD,
     CONFIDENCE_GRACE_FRAMES,
@@ -127,8 +123,7 @@ class _PlayerDetectState:
         self.locked: bool = False
         self.lock_counter: int = 0
 
-        # Adaptive HSV counter
-        self.hsv_adapt_counter: int = 0
+
 
         # Position history (for proximity bonus + EMA smoothing)
         self.prev_pos: np.ndarray = initial_pos.copy()
@@ -143,7 +138,7 @@ class _PlayerDetectState:
         self.edge_score: float = 0.0
         self.shape_score: float = 0.0
         self.proximity_score: float = 0.0
-        self.motion_score: float = 0.0
+
         self.confidence: float = 0.0   # fused
 
         # Hysteresis / grace state for contour persistence
@@ -284,16 +279,6 @@ class PaddleTracker:
         # Game mode flag
         self.in_game: bool = False
 
-        # Optional background subtractor for motion mask
-        self._bg_sub: cv2.BackgroundSubtractor | None = None
-        self._motion_mask: np.ndarray | None = None
-        self._prev_gray: np.ndarray | None = None     # previous grayscale frame
-        self._velocity_mask: np.ndarray | None = None  # fast-motion mask (frame diff)
-        if DETECT_USE_MOTION_MASK:
-            self._bg_sub = cv2.createBackgroundSubtractorMOG2(
-                history=300, varThreshold=40, detectShadows=False,
-            )
-
     def reset_to_priors(self) -> None:
         """Reset HSV ranges to broad priors and clear lock state.
 
@@ -328,28 +313,6 @@ class PaddleTracker:
         # LAB color space (used for lighting-robust color scoring)
         self._curr_lab = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2LAB)
 
-        # Motion foreground mask
-        if self._bg_sub is not None:
-            fg = self._bg_sub.apply(frame_bgr, learningRate=MOTION_MASK_LEARNING_RATE)
-            # Clean up noise
-            fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, _KERN_OPEN)
-            fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, _KERN_CLOSE)
-            self._motion_mask = fg
-        else:
-            self._motion_mask = None
-
-        # Fast-motion velocity mask (frame differencing)
-        # High threshold isolates rapidly moving pixels (paddle swings)
-        # while rejecting slowly drifting objects (shirts, body movement)
-        if self._prev_gray is not None:
-            diff = cv2.absdiff(self._prev_gray, self._curr_gray)
-            _, vel = cv2.threshold(diff, 35, 255, cv2.THRESH_BINARY)
-            vel = cv2.morphologyEx(vel, cv2.MORPH_CLOSE, _KERN_CLOSE)
-            vel = cv2.morphologyEx(vel, cv2.MORPH_OPEN, _KERN_OPEN_THIN)
-            self._velocity_mask = vel
-        else:
-            self._velocity_mask = None
-        self._prev_gray = self._curr_gray.copy()
 
         # Kalman predict step for both players (sets kalman_pos before detection)
         for is_p1 in (True, False):
@@ -528,17 +491,7 @@ class PaddleTracker:
         # Normalise: 0 at max jump, 1 at same position
         return max(0.0, 1.0 - dist / max(TRACKING_REACQUIRE_MAX_JUMP, 1.0))
 
-    def _motion_overlap(self, contour: np.ndarray) -> float:
-        """Fraction of contour overlapping motion foreground."""
-        if self._motion_mask is None:
-            return 1.0  # no mask -> neutral
-        cmask = np.zeros(self._motion_mask.shape, dtype=np.uint8)
-        cv2.drawContours(cmask, [contour], -1, 255, -1)
-        n_contour = np.count_nonzero(cmask)
-        if n_contour == 0:
-            return 0.0
-        n_overlap = np.count_nonzero(cv2.bitwise_and(cmask, self._motion_mask))
-        return float(n_overlap) / n_contour
+
 
     # ------------------------------------------------------------------
     # Main per-frame detection (replaces track_paddle)
@@ -596,20 +549,13 @@ class PaddleTracker:
                 s_score = self._shape_score(c)
                 # When lost, don't penalise distance from stale prediction
                 p_score = 1.0 if lost else self._proximity_score(c, st.prev_pos)
-                m_overlap = self._motion_overlap(c)
-
-                # Motion gate: if motion mask is enabled and overlap is too low,
-                # penalise softly (paddle may be briefly still during gameplay)
-                motion_mult = 1.0
-                if self._motion_mask is not None and m_overlap < MOTION_MASK_MIN_OVERLAP:
-                    motion_mult = MOTION_PENALTY_MULT
 
                 fused = (
                     c_score * DETECT_COLOR_WEIGHT
                     + e_score * DETECT_EDGE_WEIGHT
                     + s_score * DETECT_SHAPE_WEIGHT
                     + p_score * DETECT_PROXIMITY_WEIGHT
-                ) * motion_mult
+                )
 
                 # Edge-on boost: when contour is very thin (high aspect) but
                 # colour match is solid, compensate for the low shape score
@@ -620,7 +566,7 @@ class PaddleTracker:
 
                 cx = bx + bw / 2.0
                 cy = by + bh / 2.0
-                candidates.append((c, cx, cy, fused, c_score, e_score, s_score, p_score, m_overlap))
+                candidates.append((c, cx, cy, fused, c_score, e_score, s_score, p_score))
 
         # ROI-first search near Kalman-predicted position (or prev_pos).
         if not lost:
@@ -655,21 +601,20 @@ class PaddleTracker:
             st.edge_score = 0.0
             st.shape_score = 0.0
             st.proximity_score = 0.0
-            st.motion_score = 0.0
+
             st.confidence = 0.0
             st.debug_reject_reason = "no candidates"
             return (None, st.smooth_pos.copy(), 0.0)
 
         # Pick best candidate
         best = max(candidates, key=lambda t: t[3])
-        contour, cx, cy, fused, c_sc, e_sc, s_sc, p_sc, m_sc = best
+        contour, cx, cy, fused, c_sc, e_sc, s_sc, p_sc = best
 
         # Store per-cue scores for diagnostics
         st.color_score = c_sc
         st.edge_score = e_sc
         st.shape_score = s_sc
         st.proximity_score = p_sc
-        st.motion_score = m_sc
         st.confidence = min(fused, 1.0)
 
         if fused < 0.05:
@@ -1055,136 +1000,7 @@ class PaddleTracker:
         st = self._state[is_p1]
         return 1.0 if st.locked else min(st.lock_counter / CALIB_LOCK_FRAMES, 1.0)
 
-    # ------------------------------------------------------------------
-    # Adaptive HSV (gameplay)
-    # ------------------------------------------------------------------
-    def adaptive_hsv_update(
-        self, hsv: np.ndarray, contour: np.ndarray | None, is_p1: bool,
-    ):
-        if contour is None:
-            return
-        # Don't adapt HSV during gameplay — calibration sets the
-        # ranges, and adapting during play causes drift/loss.
-        if self.in_game:
-            return
-        st = self._state[is_p1]
-        if st.confidence < 0.4:
-            return
-        st.hsv_adapt_counter += 1
-        if st.hsv_adapt_counter < HSV_ADAPTIVE_INTERVAL:
-            return
-        st.hsv_adapt_counter = 0
 
-        area = cv2.contourArea(contour)
-        if area < MIN_CONTOUR_AREA * 2:
-            return
-        if not _passes_quality_strict(contour):
-            return
-
-        pixels = self._contour_pixels(hsv, contour)
-        if len(pixels) < 30:
-            return
-        hues = pixels[:, 0].astype(float)
-        sats = pixels[:, 1].astype(float)
-        vals = pixels[:, 2].astype(float)
-
-        sat_floor = PINK_CALIB_SAT_MIN if not is_p1 else 80
-        if float(np.median(sats)) < sat_floor:
-            return
-
-        weights = sats / (sats.sum() + 1e-6)
-        h_weighted = float(np.sum(hues * weights))
-        new_h_min = max(0, int(h_weighted - HSV_REFINE_HUE_TOL))
-        new_h_max = min(179, int(h_weighted + HSV_REFINE_HUE_TOL))
-
-        high_sat_mask = sats >= np.percentile(sats, 30)
-        if np.sum(high_sat_mask) >= 10:
-            sats_hs = sats[high_sat_mask]
-            vals_hs = vals[high_sat_mask]
-        else:
-            sats_hs = sats
-            vals_hs = vals
-
-        new_s_min = max(0, int(np.percentile(sats_hs, 10) - HSV_REFINE_SV_TOL))
-        new_s_max = min(255, int(np.percentile(sats_hs, 90) + HSV_REFINE_SV_TOL))
-        new_v_min = max(0, int(np.percentile(vals_hs, 10) - HSV_REFINE_SV_TOL))
-        new_v_max = min(255, int(np.percentile(vals_hs, 90) + HSV_REFINE_SV_TOL))
-
-        b = HSV_ADAPTIVE_BLEND
-        st.h_min = int(st.h_min * (1 - b) + new_h_min * b)
-        st.h_max = int(st.h_max * (1 - b) + new_h_max * b)
-        st.s_min = int(st.s_min * (1 - b) + new_s_min * b)
-        st.s_max = int(st.s_max * (1 - b) + new_s_max * b)
-        st.v_min = int(st.v_min * (1 - b) + new_v_min * b)
-        st.v_max = int(st.v_max * (1 - b) + new_v_max * b)
-        st.enforce_floors()
-
-    # ------------------------------------------------------------------
-    # Debug panel (game Settings window)
-    # ------------------------------------------------------------------
-    def show_debug_masks(self, hsv: np.ndarray):
-        blurred = self.blur_hsv(hsv)
-        m1 = self._get_mask(blurred, True)
-        m2 = self._get_mask(blurred, False)
-
-        h, w = m1.shape[:2]
-        half_w = w // 2
-        m1_s = cv2.resize(m1, (half_w, h))
-        m2_s = cv2.resize(m2, (half_w, h))
-
-        m1_vis = cv2.cvtColor(m1_s, cv2.COLOR_GRAY2BGR)
-        m2_vis = cv2.cvtColor(m2_s, cv2.COLOR_GRAY2BGR)
-
-        # Tint
-        m1_vis[:, :, 0] = m1_s
-        m1_vis[:, :, 1] = m1_s
-        m1_vis[:, :, 2] = (m1_s * 0.2).astype(np.uint8)
-
-        m2_vis[:, :, 0] = (m2_s * 0.5).astype(np.uint8)
-        m2_vis[:, :, 1] = (m2_s * 0.2).astype(np.uint8)
-        m2_vis[:, :, 2] = m2_s
-
-        cv2.putText(m1_vis, "P1 (Cyan)", (10, 25),
-                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-        cv2.putText(m2_vis, "P2 (Pink)", (10, 25),
-                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 0, 255), 2)
-
-        combo = np.hstack([m1_vis, m2_vis])
-        combo = cv2.resize(combo, (640, 240))
-
-        st1 = self._state[True]
-        st2 = self._state[False]
-
-        def _info(st_obj):
-            return (
-                f"Col:{st_obj.color_score:.2f} Edge:{st_obj.edge_score:.2f} "
-                f"Shp:{st_obj.shape_score:.2f} Prox:{st_obj.proximity_score:.2f} "
-                f"=> {st_obj.confidence:.2f}"
-            )
-
-        p1_cal = "LOCKED" if st1.locked else f"Cal {int(self.calibration_progress(True)*100)}%"
-        p2_cal = "LOCKED" if st2.locked else f"Cal {int(self.calibration_progress(False)*100)}%"
-
-        cv2.putText(combo, f"P1 {p1_cal}: {_info(st1)}",
-                     (5, 210), cv2.FONT_HERSHEY_PLAIN, 0.8, (180, 180, 180), 1)
-        cv2.putText(combo, f"P2 {p2_cal}: {_info(st2)}",
-                     (5, 225), cv2.FONT_HERSHEY_PLAIN, 0.8, (180, 180, 180), 1)
-
-        # HSV range readout
-        cv2.putText(combo, f"H:{st1.h_min}-{st1.h_max} S:{st1.s_min}-{st1.s_max}",
-                     (10, 15), cv2.FONT_HERSHEY_PLAIN, 0.8, (140, 140, 140), 1)
-        cv2.putText(combo, f"H:{st2.h_min}-{st2.h_max} S:{st2.s_min}-{st2.s_max}",
-                     (330, 15), cv2.FONT_HERSHEY_PLAIN, 0.8, (140, 140, 140), 1)
-
-        # Rejection reasons
-        if st1.debug_reject_reason:
-            cv2.putText(combo, st1.debug_reject_reason[:45],
-                         (5, 237), cv2.FONT_HERSHEY_PLAIN, 0.7, (0, 0, 200), 1)
-        if st2.debug_reject_reason:
-            cv2.putText(combo, st2.debug_reject_reason[:45],
-                         (325, 237), cv2.FONT_HERSHEY_PLAIN, 0.7, (0, 0, 200), 1)
-
-        cv2.imshow("Settings", combo)
 
     # ------------------------------------------------------------------
     # Cleanup

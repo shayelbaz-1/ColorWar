@@ -371,6 +371,7 @@ class ColorWarApp:
         pygame.display.set_caption("Color War Pong")
         pygame.mouse.set_visible(False)
         
+
         try:
             pygame.mixer.init()
         except Exception:
@@ -412,9 +413,6 @@ class ColorWarApp:
                 self.p1_contour = cnt1
                 self.p2_contour = cnt2
 
-                # Adaptive HSV during gameplay
-                self.tracker.adaptive_hsv_update(hsv, cnt1, is_p1=True)
-                self.tracker.adaptive_hsv_update(hsv, cnt2, is_p1=False)
 
                 if self.state == STATE_HOME:
                     surf = self._handle_home(frame, _bgr_to_surface)

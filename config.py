@@ -183,11 +183,6 @@ EDGE_CANNY_HIGH = 150
 # Position smoothing (exponential moving average)
 EMA_ALPHA = 0.6                  # 0=full smoothing 1=no smoothing (responsive)
 
-# Optional motion-based foreground mask (cv2 BackgroundSubtractorMOG2)
-DETECT_USE_MOTION_MASK = True    # enable foreground mask to reject static distractors
-MOTION_MASK_LEARNING_RATE = 0.005  # slow learning so static scene becomes background
-MOTION_MASK_MIN_OVERLAP = 0.15   # min fraction of contour overlapping motion fg (relaxed)
-MOTION_PENALTY_MULT = 1.0       # disabled — don't penalise still paddles during gameplay
 
 # Edge-on relaxed detection (thin paddle views)
 MIN_CONTOUR_AREA_EDGEON = 30     # min px area for edge-on candidates (very thin)

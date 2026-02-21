@@ -1,155 +1,190 @@
+"""Generate poster images AND show live contour overlay for screen-recording.
+
+Usage (from the project root, one level above ColorWar/):
+    python -m ColorWar.generate_poster_images
+
+Controls:
+    S  – Save poster grid images to poster_images/
+    Q  – Quit
+"""
+
 import cv2
 import numpy as np
-import json
-import time
 import os
-from config import *
+import sys
 
-# Ensure outputs directory exists
+# ------------------------------------------------------------------
+# Imports from the game package
+# ------------------------------------------------------------------
+from .config import (
+    PADDLE_HSV_PRIORS, HSV_BLUR_KSIZE, WIDTH, HEIGHT,
+    CALIB_LOCK_FRAMES,
+)
+from .tracking import PaddleTracker
+
 os.makedirs("poster_images", exist_ok=True)
 
 
-def add_label(img, text, color=(255,255,255)):
-    # Standardize image to BGR so we can draw colored text and stack them
+# ------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------
+def add_label(img, text, color=(255, 255, 255)):
+    """Draw a labelled heading on an image (with dark shadow)."""
     if len(img.shape) == 2:
         img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-    cv2.putText(img, text, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0,0,0), 6)
+    cv2.putText(img, text, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 6)
     cv2.putText(img, text, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 2)
     return img
 
-def create_multicue_grid(frame, p1_calib, p2_calib, bg_subtractor):
+
+def create_multicue_images(frame, tracker: PaddleTracker):
+    """Return individual images for each multi-cue detection stage."""
     raw = frame.copy()
-    
-    fg_mask = bg_subtractor.apply(frame)
-    fg_mask_colored = cv2.cvtColor(fg_mask, cv2.COLOR_GRAY2BGR)
-    
+
+    # 1. HSV colour mask (pink paddle)
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     hsv_blurred = cv2.GaussianBlur(hsv, (HSV_BLUR_KSIZE, HSV_BLUR_KSIZE), 0)
-    
-    lower = np.array([p2_calib["h_min"], p2_calib["s_min"], p2_calib["v_min"]])
-    upper = np.array([p2_calib["h_max"], p2_calib["s_max"], p2_calib["v_max"]])
-    color_mask = cv2.inRange(hsv_blurred, lower, upper)
-    
+    color_mask = tracker._get_mask(hsv_blurred, False)  # pink
     color_overlay = np.zeros_like(frame)
-    color_overlay[color_mask > 0] = (200, 100, 255) # Pinkish
-    
+    color_overlay[color_mask > 0] = (200, 100, 255)
+
+    # 2. Canny edges
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(gray, 50, 150)
-    edges_colored = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
-    edges_colored[edges > 0] = (255, 255, 0) # Cyan in BGR
-    
-    raw = add_label(raw, "1. Raw RGB Frame")
-    fg_mask_colored = add_label(fg_mask_colored, "2. Motion Mask (MOG2)")
-    color_overlay = add_label(color_overlay, "3. HSV Adaptive Threshold")
-    edges_colored = add_label(edges_colored, "4. Canny Edge Map")
-    
-    top = np.hstack([raw, fg_mask_colored])
-    bottom = np.hstack([color_overlay, edges_colored])
-    return np.vstack([top, bottom])
+    edges_vis = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
+    edges_vis[edges > 0] = (255, 255, 0)
 
-def create_watershed_sequence(frame, p1_calib, p2_calib):
+    return [
+        ("1_raw_rgb_frame.jpg", raw),
+        ("2_hsv_colour_mask.jpg", color_overlay),
+        ("3_canny_edge_map.jpg", edges_vis),
+    ]
+
+
+def create_watershed_images(frame, tracker: PaddleTracker):
+    """Return individual images for each watershed extraction stage."""
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     hsv_blurred = cv2.GaussianBlur(hsv, (HSV_BLUR_KSIZE, HSV_BLUR_KSIZE), 0)
-    
-    lower = np.array([p2_calib["h_min"], p2_calib["s_min"], p2_calib["v_min"]])
-    upper = np.array([p2_calib["h_max"], p2_calib["s_max"], p2_calib["v_max"]])
-    mask = cv2.inRange(hsv_blurred, lower, upper)
-    
+    mask = tracker._get_mask(hsv_blurred, False)  # pink
+
+    # Distance transform
     dist_transform = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
     dist_norm = cv2.normalize(dist_transform, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
     heatmap = cv2.applyColorMap(dist_norm, cv2.COLORMAP_JET)
-    # Zero out background in heatmap so it clearly shows distance from edge
     heatmap[mask == 0] = 0
-    
+
+    # Watershed markers
     _, sure_fg = cv2.threshold(dist_transform, 0.5 * dist_transform.max(), 255, 0)
-    sure_bg = cv2.dilate(mask, np.ones((5,5), np.uint8), iterations=3)
+    sure_bg = cv2.dilate(mask, np.ones((5, 5), np.uint8), iterations=3)
     sure_fg = np.uint8(sure_fg)
     unknown = cv2.subtract(sure_bg, sure_fg)
-    
+
     _, markers = cv2.connectedComponents(sure_fg)
     markers = markers + 1
     markers[unknown == 255] = 0
-    
+
     marker_vis = np.zeros_like(frame)
-    marker_vis[markers == 1] = (50, 0, 0) # Background -> dark blueish
-    marker_vis[markers > 1] = (0, 255, 0) # Foreground seeds -> green
-    marker_vis[unknown == 255] = (0, 0, 255) # Unknown boundary -> red
-    
-    markers_ws = cv2.watershed(frame.copy(), markers)
+    marker_vis[markers == 1] = (50, 0, 0)
+    marker_vis[markers > 1] = (0, 255, 0)
+    marker_vis[unknown == 255] = (0, 0, 255)
+
+    # Final: actual tracked contour
     final_output = frame.copy()
-    
-    boundary_mask = np.zeros_like(mask)
-    boundary_mask[markers_ws == -1] = 255
-    contours, _ = cv2.findContours(boundary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    if contours:
-        best_c = max(contours, key=cv2.contourArea)
-        cv2.drawContours(final_output, [best_c], -1, (200, 100, 255), 4)
-        
-    mask_bgr = add_label(mask.copy(), "1. Raw Color Mask")
-    heatmap = add_label(heatmap, "2. Distance Transform")
-    marker_vis = add_label(marker_vis, "3. Watershed Seeds", color=(100,255,100))
-    final_output = add_label(final_output, "4. Exact Contour Extraction")
+    actual_contour = tracker._state[False]._last_contour
+    if actual_contour is not None:
+        cv2.drawContours(final_output, [actual_contour], -1, (200, 100, 255), 4)
 
-    top = np.hstack([mask_bgr, heatmap])
-    bottom = np.hstack([marker_vis, final_output])
-    return np.vstack([top, bottom])
+    # Convert mask to BGR for saving
+    mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
 
+    return [
+        ("4_raw_colour_mask.jpg", mask_bgr),
+        ("5_distance_transform.jpg", heatmap),
+        ("6_watershed_seeds.jpg", marker_vis),
+        ("7_exact_contour_extraction.jpg", final_output),
+    ]
+
+
+# ------------------------------------------------------------------
+# Main
+# ------------------------------------------------------------------
 def main():
-    # Use the default hardware-tuned priors from config.py instead of a saved JSON
-    p1 = PADDLE_HSV_PRIORS["CYAN"]
-    p2 = PADDLE_HSV_PRIORS["PINK"]
-    # Using camera 0 automatically
     cap = cv2.VideoCapture(0)
-    # Try high res for nice posters
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-    
-    bg_subtractor = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=16, detectShadows=False)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
 
-    print("\n" + "="*50)
-    print("🎨 Color War Poster Image Generator 🎨")
-    print("="*50)
-    print("1. Stand back with paddles in view.")
-    print("2. Move around a bit so the motion mask kicks in.")
-    print("3. Press 'S' to save the poster grid images!")
-    print("4. Press 'Q' to quit without saving.")
-    print("="*50 + "\n")
+    tracker = PaddleTracker()
+    tracker.reset_to_priors()
+    tracker.in_game = True  # use game-mode rules (never drop contour)
+
+    # Skip cyan — only detect pink
+    tracker._state[True].locked = True
+
+    print("\n" + "=" * 55)
+    print("🎨  Color War – Poster & Live Contour Viewer  🎨")
+    print("=" * 55)
+    print("  • Wave the PINK paddle to calibrate")
+    print("  • Live contour drawn on the feed for screen recording")
+    print("  • Press  S  to save poster grid images")
+    print("  • Press  Q  to quit")
+    print("=" * 55 + "\n")
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
-            
         frame = cv2.flip(frame, 1)
-        bg_subtractor.apply(frame)
 
-        preview = frame.copy()
-        cv2.putText(preview, "Press 'S' to save poster images! (Q to quit)", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
-        cv2.imshow("Poster Generator Preview", preview)
+        # --- Exact game pipeline ---
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        hsv_blurred = tracker.blur_hsv(hsv)
+        tracker.begin_frame(frame)
+
+        st_pink = tracker._state[False]
+        if not st_pink.locked:
+            tracker.calibrate_step(hsv, hsv_blurred)
+        else:
+            pos, contour = tracker.track_paddle(hsv_blurred, False)
+
+        tracker.end_frame()
+
+        # --- Draw live contour (pink only) ---
+        display = frame.copy()
+
+        contour = st_pink._last_contour
+        if contour is not None:
+            cv2.drawContours(display, [contour], -1, (200, 100, 255), 3)
+            bx, by, bw, bh = cv2.boundingRect(contour)
+            cv2.putText(display, "PINK", (bx, by - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 100, 255), 2)
+
+        # Status overlay
+        if not st_pink.locked:
+            pct = int(st_pink.lock_counter / CALIB_LOCK_FRAMES * 100)
+            cv2.putText(display, f"Wave pink paddle...  {pct}%", (30, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+        else:
+            cv2.putText(display, "PINK OK  |  S=save  Q=quit",
+                        (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+        cv2.imshow("Color War - Live Contours", display)
 
         key = cv2.waitKey(1) & 0xFF
-        if key == ord('s'):
-            print("Capturing frame and generating visualizations...")
-            
-            grid1 = create_multicue_grid(frame, p1, p2, bg_subtractor)
-            grid2 = create_watershed_sequence(frame, p1, p2)
-            
-            p1 = "poster_images/multicue_feature_grid.jpg"
-            p2 = "poster_images/watershed_extraction_grid.jpg"
-            cv2.imwrite(p1, grid1)
-            cv2.imwrite(p2, grid2)
-            
-            print(f"✅ Saved `{p1}`!")
-            print(f"✅ Saved `{p2}`!")
-            break
-            
+        if key == ord('s') and st_pink.locked:
+            print("Capturing frame and generating images...")
+            all_images = create_multicue_images(frame, tracker) + create_watershed_images(frame, tracker)
+            for fname, img in all_images:
+                path = os.path.join("poster_images", fname)
+                cv2.imwrite(path, img)
+                print(f"  ✅ {path}")
+
         elif key == ord('q'):
-            print("Cancelled.")
+            print("Done.")
             break
 
     cap.release()
     cv2.destroyAllWindows()
+
 
 if __name__ == "__main__":
     main()
