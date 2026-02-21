@@ -54,7 +54,6 @@ class ColorWarApp:
         self.cap.set(4, HEIGHT)
 
         self.tracker = PaddleTracker()
-        self._load_calibration_profile()
         self.engine = GameEngine()
         self.ui = UIManager()
         self.challenges = ChallengeManager()
@@ -69,6 +68,7 @@ class ColorWarApp:
             pass
 
         self.state: str = STATE_AUTODETECT
+        self.tracker.reset_to_priors()  # Start from broad priors for auto-calibration
         self._calib_step: int = 0
         self._current_bgm: str | None = None
 
@@ -111,18 +111,6 @@ class ColorWarApp:
         self._replay_step: float = 0.0
 
     # ------------------------------------------------------------------
-    # Calibration profile loader (optional — from calibration_app.py)
-    # ------------------------------------------------------------------
-    def _load_calibration_profile(self):
-        """Load tuned HSV ranges from a calibration profile if one exists."""
-        try:
-            from .calibration_app import load_profile, _PROFILE_PATH
-            if _PROFILE_PATH.exists():
-                ok = load_profile(self.tracker)
-                if ok:
-                    print("[ColorWar] Loaded calibration profile:", _PROFILE_PATH)
-        except Exception:
-            pass  # calibration_app not available or profile missing — no problem
 
     # ------------------------------------------------------------------
     # Sound helpers
@@ -456,7 +444,7 @@ class ColorWarApp:
                     elif event.key == pygame.K_c and self.state in (STATE_HOME, STATE_RESULTS):
                         # Quick re-enter calibration
                         self.tracker = PaddleTracker()
-                        self._load_calibration_profile()
+                        self.tracker.reset_to_priors()  # Fresh broad priors
                         self.state = STATE_AUTODETECT
                         self._calib_step = 0
                         
@@ -815,14 +803,10 @@ class ColorWarApp:
         if self.p1_contour is not None and not (in_prestart and p1_wrong):
             thickness = 3 if p1_conf >= TRACKING_CONFIDENCE_MIN else 1
             cv2.drawContours(blend, [self.p1_contour], -1, p1_draw_col, thickness)
-        else:
-            cv2.circle(blend, (int(game_p1[0]), int(game_p1[1])), PADDLE_RADIUS, p1_draw_col, 3)
 
         if self.p2_contour is not None and not (in_prestart and p2_wrong):
             thickness = 3 if p2_conf >= TRACKING_CONFIDENCE_MIN else 1
             cv2.drawContours(blend, [self.p2_contour], -1, p2_draw_col, thickness)
-        else:
-            cv2.circle(blend, (int(game_p2[0]), int(game_p2[1])), PADDLE_RADIUS, p2_draw_col, 3)
 
         # Pulsating wrong-side warning overlay
         if not in_prestart:

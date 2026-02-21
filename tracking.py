@@ -155,6 +155,12 @@ class _PlayerDetectState:
         self.debug_reject_reason: str = ""
         self.debug_lock_fail_reason: str = ""
 
+        # Calibration spatial consistency: anchor position during lock-up
+        self.calib_anchor_pos: np.ndarray | None = None
+
+        # Size continuity: last accepted contour area (for jump rejection)
+        self.last_area: float = 0.0
+
         # --- Kalman filter (6-state: x, y, dx, dy, w, h) ---
         self.kalman: cv2.KalmanFilter = self._init_kalman(initial_pos)
         self.kalman_miss_count: int = 0
@@ -281,10 +287,31 @@ class PaddleTracker:
         # Optional background subtractor for motion mask
         self._bg_sub: cv2.BackgroundSubtractor | None = None
         self._motion_mask: np.ndarray | None = None
+        self._prev_gray: np.ndarray | None = None     # previous grayscale frame
+        self._velocity_mask: np.ndarray | None = None  # fast-motion mask (frame diff)
         if DETECT_USE_MOTION_MASK:
             self._bg_sub = cv2.createBackgroundSubtractorMOG2(
                 history=300, varThreshold=40, detectShadows=False,
             )
+
+    def reset_to_priors(self) -> None:
+        """Reset HSV ranges to broad priors and clear lock state.
+
+        Called before auto-calibration so that stale saved profiles
+        don't constrain the motion-guided colour learning.
+        """
+        for is_p1, key in [(True, "CYAN"), (False, "PINK")]:
+            st = self._state[is_p1]
+            prior = PADDLE_HSV_PRIORS[key]
+            st.h_min = prior["h_min"]
+            st.h_max = prior["h_max"]
+            st.s_min = prior["s_min"]
+            st.s_max = prior["s_max"]
+            st.v_min = prior["v_min"]
+            st.v_max = prior["v_max"]
+            st.locked = False
+            st.lock_counter = 0
+            st.lab_ref = None
 
     # ------------------------------------------------------------------
     # Frame lifecycle
@@ -310,6 +337,19 @@ class PaddleTracker:
             self._motion_mask = fg
         else:
             self._motion_mask = None
+
+        # Fast-motion velocity mask (frame differencing)
+        # High threshold isolates rapidly moving pixels (paddle swings)
+        # while rejecting slowly drifting objects (shirts, body movement)
+        if self._prev_gray is not None:
+            diff = cv2.absdiff(self._prev_gray, self._curr_gray)
+            _, vel = cv2.threshold(diff, 35, 255, cv2.THRESH_BINARY)
+            vel = cv2.morphologyEx(vel, cv2.MORPH_CLOSE, _KERN_CLOSE)
+            vel = cv2.morphologyEx(vel, cv2.MORPH_OPEN, _KERN_OPEN_THIN)
+            self._velocity_mask = vel
+        else:
+            self._velocity_mask = None
+        self._prev_gray = self._curr_gray.copy()
 
         # Kalman predict step for both players (sets kalman_pos before detection)
         for is_p1 in (True, False):
@@ -513,7 +553,12 @@ class PaddleTracker:
         st = self._state[is_p1]
         mask = self._get_mask(hsv_blurred, is_p1)
 
+        # When the paddle has been missing for too long, skip ROI and
+        # search the full frame to enable re-acquisition at any position.
+        lost = st.miss_count > CONFIDENCE_GRACE_FRAMES
+
         candidates = []
+
         def _score_mask(mask_view: np.ndarray, x_off: int = 0, y_off: int = 0):
             contours, _ = cv2.findContours(
                 mask_view, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
@@ -549,7 +594,8 @@ class PaddleTracker:
                 c_score = self._color_score(c, hsv, is_p1)
                 e_score = self._edge_score(c)
                 s_score = self._shape_score(c)
-                p_score = self._proximity_score(c, st.prev_pos)
+                # When lost, don't penalise distance from stale prediction
+                p_score = 1.0 if lost else self._proximity_score(c, st.prev_pos)
                 m_overlap = self._motion_overlap(c)
 
                 # Motion gate: if motion mask is enabled and overlap is too low,
@@ -577,29 +623,30 @@ class PaddleTracker:
                 candidates.append((c, cx, cy, fused, c_score, e_score, s_score, p_score, m_overlap))
 
         # ROI-first search near Kalman-predicted position (or prev_pos).
-        kp = st.kalman_pos
-        px = int(round(kp[0]))
-        py = int(round(kp[1]))
-        x0 = max(0, px - _ROI_HALF_SIZE)
-        x1 = min(WIDTH, px + _ROI_HALF_SIZE)
-        y0 = max(0, py - _ROI_HALF_SIZE)
-        y1 = min(HEIGHT, py + _ROI_HALF_SIZE)
+        if not lost:
+            kp = st.kalman_pos
+            px = int(round(kp[0]))
+            py = int(round(kp[1]))
+            x0 = max(0, px - _ROI_HALF_SIZE)
+            x1 = min(WIDTH, px + _ROI_HALF_SIZE)
+            y0 = max(0, py - _ROI_HALF_SIZE)
+            y1 = min(HEIGHT, py + _ROI_HALF_SIZE)
 
-        if (x1 - x0) > 8 and (y1 - y0) > 8:
-            _score_mask(mask[y0:y1, x0:x1], x0, y0)
+            if (x1 - x0) > 8 and (y1 - y0) > 8:
+                _score_mask(mask[y0:y1, x0:x1], x0, y0)
 
-        # Fallback: CSRT bounding box ROI if available and no candidates.
-        if not candidates and st.csrt_bbox is not None and USE_CSRT_FALLBACK:
-            bx, by, bw, bh = st.csrt_bbox
-            pad = int(max(bw, bh) * 0.3)
-            cx0 = max(0, bx - pad)
-            cy0 = max(0, by - pad)
-            cx1 = min(WIDTH, bx + bw + pad)
-            cy1 = min(HEIGHT, by + bh + pad)
-            if (cx1 - cx0) > 8 and (cy1 - cy0) > 8:
-                _score_mask(mask[cy0:cy1, cx0:cx1], cx0, cy0)
+            # Fallback: CSRT bounding box ROI if available and no candidates.
+            if not candidates and st.csrt_bbox is not None and USE_CSRT_FALLBACK:
+                bx, by, bw, bh = st.csrt_bbox
+                pad = int(max(bw, bh) * 0.3)
+                cx0 = max(0, bx - pad)
+                cy0 = max(0, by - pad)
+                cx1 = min(WIDTH, bx + bw + pad)
+                cy1 = min(HEIGHT, by + bh + pad)
+                if (cx1 - cx0) > 8 and (cy1 - cy0) > 8:
+                    _score_mask(mask[cy0:cy1, cx0:cx1], cx0, cy0)
 
-        # Fallback to full frame when ROI has no candidates.
+        # Fallback to full frame when ROI has no candidates or paddle is lost.
         if not candidates:
             _score_mask(mask)
 
@@ -727,6 +774,13 @@ class PaddleTracker:
             st.smooth_pos = alpha * center + (1.0 - alpha) * st.smooth_pos
             st.prev_pos = center.copy()
             st.miss_count = 0
+
+            # Update last_area with EMA for size continuity guard
+            det_area = float(cv2.contourArea(contour))
+            if st.last_area > 0:
+                st.last_area = 0.7 * st.last_area + 0.3 * det_area
+            else:
+                st.last_area = det_area
             st.last_seen_time = _time.time()
 
             # --- CSRT re-initialization on good detections ---
@@ -773,6 +827,8 @@ class PaddleTracker:
         use_contour = smoothed_contour if smoothed_contour is not None else contour
 
         # PARITY: Hysteresis confidence gate with grace frames.
+        # During gameplay, NEVER drop the contour — always hold the
+        # last known contour to avoid visual gaps.
         if st._contour_held:
             if conf >= CONFIDENCE_HOLD and use_contour is not None:
                 st._grace_counter = CONFIDENCE_GRACE_FRAMES
@@ -780,6 +836,9 @@ class PaddleTracker:
                 out_contour = use_contour
             elif st._grace_counter > 0:
                 st._grace_counter -= 1
+                out_contour = st._last_contour
+            elif self.in_game:
+                # In-game: keep showing last contour (never drop)
                 out_contour = st._last_contour
             else:
                 st._contour_held = False
@@ -855,9 +914,9 @@ class PaddleTracker:
                 continue
 
             mask = self._get_mask(hsv_blurred, is_p1)
-            # Fuse with motion mask: only consider MOVING colored blobs
-            if self._motion_mask is not None:
-                mask = cv2.bitwise_and(mask, self._motion_mask)
+            # No motion mask during calibration — broad HSV priors are
+            # selective enough, and MOG2 needs warm-up time that delays
+            # detection.
             contours, _ = cv2.findContours(
                 mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
             )
@@ -1003,6 +1062,10 @@ class PaddleTracker:
         self, hsv: np.ndarray, contour: np.ndarray | None, is_p1: bool,
     ):
         if contour is None:
+            return
+        # Don't adapt HSV during gameplay — calibration sets the
+        # ranges, and adapting during play causes drift/loss.
+        if self.in_game:
             return
         st = self._state[is_p1]
         if st.confidence < 0.4:

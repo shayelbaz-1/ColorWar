@@ -162,8 +162,8 @@ CONTOUR_AREA_MAX = 25000         # reject huge blobs (entire shirt detected)
 
 # Runtime confidence — hysteresis gate (0.0 – 1.0)
 TRACKING_CONFIDENCE_MIN = 0.25   # threshold to START showing real contour
-CONFIDENCE_HOLD = 0.12           # lower threshold to KEEP contour (hysteresis)
-CONFIDENCE_GRACE_FRAMES = 3      # frames of grace before dropping to circle
+CONFIDENCE_HOLD = 0.08           # lower threshold to KEEP contour (hysteresis)
+CONFIDENCE_GRACE_FRAMES = 15     # frames of grace before dropping contour
 
 # ---------------------------------------------------------------------------
 # Classical per-frame detection (color + edge + shape — no temporal trackers)
@@ -187,7 +187,7 @@ EMA_ALPHA = 0.6                  # 0=full smoothing 1=no smoothing (responsive)
 DETECT_USE_MOTION_MASK = True    # enable foreground mask to reject static distractors
 MOTION_MASK_LEARNING_RATE = 0.005  # slow learning so static scene becomes background
 MOTION_MASK_MIN_OVERLAP = 0.15   # min fraction of contour overlapping motion fg (relaxed)
-MOTION_PENALTY_MULT = 0.5       # penalty multiplier when overlap is below threshold (was 0.3)
+MOTION_PENALTY_MULT = 1.0       # disabled — don't penalise still paddles during gameplay
 
 # Edge-on relaxed detection (thin paddle views)
 MIN_CONTOUR_AREA_EDGEON = 30     # min px area for edge-on candidates (very thin)
